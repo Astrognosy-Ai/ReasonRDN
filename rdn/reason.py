@@ -5,34 +5,35 @@ This is the "one thing" you (and agents) should use.
 
 It unifies:
 - Local ReasonRDN handoffs (repo state, decisions, insights)
-- Seamless auto-deposit to the warf Xchange broker (warf.astrognosy.com)
-- Resolution from the reason:// Xport registry (reason.astrognosy.com)
+- Explicit arbitration through the WARF Gateway (warf.astrognosy.com)
+- Explicit selected-result admission to the Reason Registry
+- Resolution from the Reason Registry (reason.astrognosy.com)
 
-The public package talks to the broker boundary. Scoring and promotion internals
-are not implemented or described here.
+The public package talks to the Gateway and Registry boundaries. Protected
+scoring internals are not implemented or described here.
 
 Usage (the simple coherent way):
     import rdn.reason as reason
 
     reason.remember("Fixed the race using prior handoff context...", tags=["infra"])
-    artifact = reason.resolve("reason://ops/deployment/ecs-failures")   # hits Xport when Xchange mode
-    result = reason.xchange_arbitrate("best fix for X?", packages=[...])
+    artifact = reason.resolve("reason://ops/deployment/ecs-failures")
+    result = reason.network_arbitrate("best fix for X?", packages=[...])
 
 Or the full client:
     from rdn.reason import Reason
-    r = Reason(xchange=True)
+    r = Reason(network=True)
 """
 
 from __future__ import annotations
 
 import json
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .client import RDNClient, XPORT_URL, XCHANGE_BROKER_URL
+from .artifact import ReasonArtifact
+from .client import REASON_REGISTRY_URL, WARF_GATEWAY_URL, RDNClient
+from .config import env_flag
 
 # Simple persistent metrics for the agnostic harness
 METRICS_FILE = Path.home() / ".reason-rdn" / "harness_metrics.json"
@@ -107,9 +108,9 @@ class HarnessMetrics:
     def get_suggestions(self) -> List[str]:
         suggestions = []
         if self.data["total_recalls"] > 5 and self.data["estimated_tokens_saved"] > 10000:
-            suggestions.append("High recall rate - you are benefiting from prior artifacts. Consider sharing a precise reason:// URI so strong work can be reused by the network.")
+            suggestions.append("High recall rate - you are benefiting from prior artifacts. Give selected work a precise reason:// address so it can be arbitrated and admitted when useful.")
         if self.data["vibe_stars"] > 3:
-            suggestions.append("Strong positive signal. Share high-signal handoffs via Xchange with a reason:// URI when possible.")
+            suggestions.append("Strong positive signal. Consider explicit WARF arbitration and Registry admission for the best handoff.")
         if self.get_ship_rate() < 20:
             suggestions.append("Ship rate low - add clearer project, tags, and state_tokens in handoffs to improve local recall precision.")
         self.data["workflow_suggestions"] = suggestions[:3]
@@ -132,37 +133,88 @@ _harness_metrics = HarnessMetrics()
 # The single coherent high-level namespace (what agents and humans should reach for)
 class Reason:
     """
-    One coherent object for local + full warf/Xchange/Xport stack.
+    One coherent object for local memory plus the optional WARF network.
 
     Automatically handles the split:
-    - Broker (warf.astrognosy.com) for deposits and arbitration
-    - Xport (reason.astrognosy.com) for clean reason:// resolution
+    - WARF Gateway (warf.astrognosy.com) for arbitration
+    - Reason Registry (reason.astrognosy.com) for admission and resolution
     """
 
-    def __init__(self, xchange: bool = False):
+    def __init__(self, xchange: bool = False, network: Optional[bool] = None):
         self._client = RDNClient()
-        self._xchange_mode = xchange or bool(os.environ.get("REASON_USE_XCHANGE"))
+        env_network = env_flag("REASON_USE_NETWORK", "REASON_USE_XCHANGE")
+        self._xchange_mode = (
+            xchange or env_network
+            if network is None
+            else network
+        )
         if self._xchange_mode:
-            self._client.broker_url = XCHANGE_BROKER_URL
-            self._client.xport_url = XPORT_URL
-            self._client.node_url = XCHANGE_BROKER_URL
+            self._client.broker_url = self._client.broker_url or WARF_GATEWAY_URL
+            self._client.xport_url = self._client.xport_url or REASON_REGISTRY_URL
 
     def remember(self, content: str, **kwargs) -> Dict[str, Any]:
-        """Unified deposit. Goes to Xchange broker when in Xchange mode."""
-        if self._xchange_mode:
-            return self._client.share_to_xchange(content, **kwargs)
-        return self._client.remember(content, **kwargs)
+        """Remember locally; publication requires later arbitration and admission."""
+        options = dict(kwargs)
+        network_share = options.pop("network_share", None)
+        compatibility_share = options.pop("xchange_share", None)
+        if network_share is not None:
+            should_share = bool(network_share)
+        elif compatibility_share is not None:
+            should_share = bool(compatibility_share)
+        else:
+            should_share = False
+        uri = options.pop("uri", None) or options.pop("reason_address", None)
 
-    def resolve(self, uri_or_address: str) -> Optional[Dict[str, Any]]:
-        """Smart resolve. Prefers Xport for reason:// URIs when Xchange mode is on."""
-        if self._xchange_mode and uri_or_address.startswith("reason://"):
-            return self._client.resolve_from_xport(uri_or_address)
-        return self._client.resolve(uri_or_address)
+        local_options = dict(options)
+        if uri:
+            local_options["reason_address"] = uri
+        local_result = self._client.remember(content, **local_options)
+        if local_result.get("status") != "remembered":
+            return local_result
+
+        if not should_share:
+            return local_result
+
+        return {
+            "status": "admission-required",
+            "reason": "requires-arbitration",
+            "address": uri or local_result.get("address"),
+            "local_copy_retained": True,
+            "local": local_result,
+            "next": ["arbitrate", "admit"],
+        }
+
+    def resolve(
+        self,
+        uri_or_address: str,
+        *,
+        source: str = "local",
+        version: Optional[str] = None,
+        bypass_cache: bool = False,
+    ) -> Optional[ReasonArtifact]:
+        """Resolve from exactly ``local`` or ``registry``; never fall through."""
+        return self._client.resolve(
+            uri_or_address,
+            source=source,
+            version=version,
+            bypass_cache=bypass_cache,
+        )
+
+    def network_arbitrate(self, query_text: str, packages: List[Dict[str, Any]], **kwargs):
+        self._client.broker_url = self._client.broker_url or WARF_GATEWAY_URL
+        return self._client.network_arbitrate(query_text, packages, **kwargs)
+
+    def admit(self, artifact, arbitration, *, expected_current_version=None):
+        """Explicitly request create-only or compare-and-set Registry admission."""
+        self._client.xport_url = self._client.xport_url or REASON_REGISTRY_URL
+        return self._client.admit(
+            artifact,
+            arbitration,
+            expected_current_version=expected_current_version,
+        )
 
     def xchange_arbitrate(self, query_text: str, packages: List[Dict[str, Any]], **kwargs):
-        if not self._xchange_mode:
-            raise RuntimeError("Enable Xchange mode (REASON_USE_XCHANGE=1 or Reason(xchange=True))")
-        return self._client.xchange_arbitrate(query_text, packages, **kwargs)
+        return self.network_arbitrate(query_text, packages, **kwargs)
 
     def list_prefix(self, prefix: str, limit: int = 20):
         """List artifacts under a reason:// prefix (great for browsing with partial URIs)."""
@@ -171,6 +223,13 @@ class Reason:
     @property
     def status(self):
         return {
+            "network_mode": self._xchange_mode,
+            "gateway": getattr(self._client, "broker_url", None),
+            "registry": getattr(self._client, "xport_url", None),
+            "network_available": bool(
+                getattr(self._client, "broker_url", None)
+                and getattr(self._client, "xport_url", None)
+            ),
             "xchange_mode": self._xchange_mode,
             "broker": getattr(self._client, "broker_url", None),
             "xport": getattr(self._client, "xport_url", None),
@@ -180,48 +239,102 @@ class Reason:
 
 # Back-compat + advanced SDK bridge (thin, safe)
 class ReasonClient(Reason):
-    """Xport-focused client (for resolution of promoted reason:// artifacts)."""
+    """Reason Registry-focused client."""
     def __init__(self, endpoint: str = None, **kwargs):
         super().__init__(xchange=False)
-        self._client.xport_url = endpoint or XPORT_URL
-        self._client.node_url = endpoint or XPORT_URL
+        self._client.xport_url = endpoint or REASON_REGISTRY_URL
+
+    def resolve(
+        self,
+        uri_or_address: str,
+        *,
+        source: str = "registry",
+        version: Optional[str] = None,
+        bypass_cache: bool = False,
+    ) -> Optional[ReasonArtifact]:
+        return self._client.resolve(
+            uri_or_address,
+            source=source,
+            version=version,
+            bypass_cache=bypass_cache,
+        )
 
 
 class WARFClient(Reason):
-    """Broker-focused client for deposits and arbitration."""
+    """Compatibility name for explicit Gateway arbitration and Registry admission."""
     def __init__(self, broker_endpoint: str = None, **kwargs):
         super().__init__(xchange=True)
-        self._client.broker_url = broker_endpoint or XCHANGE_BROKER_URL
-        self._client.node_url = broker_endpoint or XCHANGE_BROKER_URL
+        self._client.broker_url = broker_endpoint or WARF_GATEWAY_URL
 
 
 # Module-level convenience (the "simplest coherent API")
 _default_reason = None
 
+
+def _network_result_succeeded(result: Dict[str, Any]) -> bool:
+    status_value = str(result.get("status") or "").lower()
+    return status_value in {"shared", "accepted", "ok", "success", "promoted"} or bool(
+        result.get("audit_hash") and result.get("winner")
+    )
+
+
 def _get_default():
     global _default_reason
     if _default_reason is None:
-        _default_reason = Reason(xchange=bool(os.environ.get("REASON_USE_XCHANGE")))
+        _default_reason = Reason()
     return _default_reason
 
 def remember(content: str, tokens_used: int = None, **kwargs):
     """Coherent remember. Pass tokens_used=1234 for accurate harness accounting."""
     res = _get_default().remember(content, **kwargs)
     _harness_metrics.record_handoff(content, kwargs.get("tags"), tokens_used=tokens_used)
-    if kwargs.get("xchange_share") or os.environ.get("REASON_USE_XCHANGE"):
+    network_share = kwargs.get("network_share")
+    compatibility_share = kwargs.get("xchange_share")
+    if network_share is not None:
+        share_requested = bool(network_share)
+    elif compatibility_share is not None:
+        share_requested = bool(compatibility_share)
+    else:
+        share_requested = False
+    if share_requested and _network_result_succeeded(res):
         _harness_metrics.record_xchange_share()
     return res
 
-def resolve(uri_or_address: str, tokens_saved: int = None):
+def resolve(
+    uri_or_address: str,
+    tokens_saved: int = None,
+    *,
+    source: str = "local",
+    version: Optional[str] = None,
+    bypass_cache: bool = False,
+):
     """Coherent resolve. Pass tokens_saved=... (from the agent) for real metrics."""
-    res = _get_default().resolve(uri_or_address)
+    res = _get_default().resolve(
+        uri_or_address,
+        source=source,
+        version=version,
+        bypass_cache=bypass_cache,
+    )
     _harness_metrics.record_recall(str(uri_or_address), tokens_saved=tokens_saved)
     return res
 
-def xchange_arbitrate(query_text: str, packages: List[Dict[str, Any]], **kwargs):
-    res = _get_default().xchange_arbitrate(query_text, packages, **kwargs)
-    _harness_metrics.record_xchange_share()
+def network_arbitrate(query_text: str, packages: List[Dict[str, Any]], **kwargs):
+    res = _get_default().network_arbitrate(query_text, packages, **kwargs)
+    if _network_result_succeeded(res):
+        _harness_metrics.record_xchange_share()
     return res
+
+
+def admit(artifact, arbitration, *, expected_current_version=None):
+    """Explicit arbitration-backed Reason Registry admission."""
+    return _get_default().admit(
+        artifact,
+        arbitration,
+        expected_current_version=expected_current_version,
+    )
+
+def xchange_arbitrate(query_text: str, packages: List[Dict[str, Any]], **kwargs):
+    return network_arbitrate(query_text, packages, **kwargs)
 
 def status():
     base = _get_default().status

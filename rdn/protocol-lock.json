@@ -1,0 +1,53 @@
+{
+  "$id": "astrognosy.reason-artifact/v1",
+  "packageVersion": "0.5.0",
+  "eventRecordSchema": "https://warf.astrognosy.com/schemas/event-record/v2",
+  "uri": {
+    "scheme": "reason",
+    "segments": 3,
+    "segmentPattern": "[a-z][a-z0-9-]{0,62}"
+  },
+  "artifact": {
+    "fields": [
+      "address",
+      "version",
+      "media_type",
+      "content",
+      "content_digest",
+      "content_digest_algorithm",
+      "canonical_encoding",
+      "validation",
+      "admitted_at"
+    ],
+    "contentDigestAlgorithm": "SHA-256",
+    "mediaTypeMaxLength": 255,
+    "stringEncoding": "utf-8",
+    "structuredEncoding": "RFC8785/JCS",
+    "versionPrefix": "sha256:",
+    "versionMaterialFields": [
+      "address",
+      "media_type",
+      "content_digest",
+      "canonical_encoding",
+      "validation"
+    ],
+    "validationOrder": "RFC8785/JCS bytewise ascending",
+    "registryValidationMinItems": 1,
+    "admittedAtInVersion": false
+  },
+  "sdk": {
+    "resolutionSources": ["local", "registry"],
+    "defaultResolutionSource": "local",
+    "automaticNetworkFallback": false
+  },
+  "mcp": {
+    "advertisedTools": [
+      "remember",
+      "recall",
+      "resolve",
+      "arbitrate",
+      "admit",
+      "status"
+    ]
+  }
+}

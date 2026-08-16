@@ -1,23 +1,36 @@
 """
 rdn.client - Unified memory client for ReasonRDN.
 
-This package is the public local-first on-ramp for reason:// memory. It can
-work entirely offline with a local SQLite-backed node, or it can send selected
-artifacts to the public broker at warf.astrognosy.com. The broker is the public
-network boundary for deposits, arbitration, and any downstream promotion.
+This package is the public local-first on-ramp for reason:// memory. It works
+entirely offline with a local SQLite-backed node. Explicit calls can arbitrate
+competing packages through the WARF Gateway and admit the selected result to
+the Reason Registry; local memory operations never trigger those network acts.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
+
+import rfc8785
+
+from .addressing import project_address as _project_address
+from .artifact import (
+    EVENT_RECORD_SCHEMA,
+    ArtifactValidationError,
+    ReasonArtifact,
+    parse_reason_artifact,
+    validate_reason_address,
+)
+from .config import env_flag
 
 try:
     import requests  # Preferred for robustness
@@ -25,13 +38,15 @@ except ImportError:
     requests = None
 
 try:
-    from urllib import request as urllib_request
     from urllib import error as urllib_error
+    from urllib import request as urllib_request
     from urllib.parse import quote as url_quote
 except Exception:
     urllib_request = None  # type: ignore
     urllib_error = None  # type: ignore
-    url_quote = lambda s: s  # type: ignore
+
+    def url_quote(value):  # type: ignore
+        return value
 
 logger = logging.getLogger("rdn.client")
 
@@ -41,12 +56,14 @@ PORT_FILE = DEFAULT_DB_DIR / "private-node.port"
 CONFIG_FILE = Path.home() / ".reason-ecosystem.cfg"
 
 # Public front door for deposits, shares, and arbitration.
-XCHANGE_BROKER_URL = "https://warf.astrognosy.com"
+WARF_GATEWAY_URL = "https://warf.astrognosy.com"
+XCHANGE_BROKER_URL = WARF_GATEWAY_URL
 
-# Xport / reason:// public registry.
+# Reason Registry / reason:// public resolver.
 # Primary: https://reason.astrognosy.com and https://xport.astrognosy.com
 # Use for resolve("reason://...") to get the current best-known reasoning.
-XPORT_URL = "https://reason.astrognosy.com"
+REASON_REGISTRY_URL = "https://reason.astrognosy.com"
+XPORT_URL = REASON_REGISTRY_URL
 
 # Backwards-compatible alias for the broker (the main place you send deposits/shares/arbitration).
 XCHANGE_URL = XCHANGE_BROKER_URL
@@ -57,6 +74,38 @@ REASON_XPORT_URL = XPORT_URL
 # Environment variable fallbacks for node URL (order of precedence)
 ENV_NODE_KEYS = ("RDN_NODE_URL", "REASON_NODE_URL", "WARF_NODE_URL", "XCHANGE_NODE_URL")
 
+class RDNRequestError(RuntimeError):
+    """Base error for an explicit Reason Registry or WARF request."""
+
+
+class RDNTransportError(RDNRequestError):
+    """The selected service could not be reached."""
+
+
+class RDNHTTPError(RDNRequestError):
+    """The selected service returned a non-success HTTP response."""
+
+    def __init__(self, status_code: int, message: str, payload: Any = None):
+        super().__init__(f"HTTP {status_code}: {message}")
+        self.status_code = int(status_code)
+        self.payload = payload
+
+
+class RDNNotFoundError(RDNHTTPError):
+    """A reason address or version is unknown to the selected Registry."""
+
+
+class RDNConflictError(RDNHTTPError):
+    """A version or current-pointer precondition did not match."""
+
+
+class RDNAuthorizationError(RDNHTTPError):
+    """The selected Registry rejected authorization."""
+
+
+class RDNUnavailableError(RDNHTTPError):
+    """The selected service is temporarily unavailable."""
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -66,11 +115,6 @@ def _hash_payload(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     ).hexdigest()
-
-
-def _project_address(project: str, content: str) -> str:
-    slug = hashlib.md5(content[:50].encode("utf-8")).hexdigest()[:8]
-    return f"reason://{project}/handoff/{slug}"
 
 
 class RDNClient:
@@ -84,7 +128,7 @@ class RDNClient:
     def __init__(
         self,
         node_url: Optional[str] = None,
-        db_path: Optional[str | Path] = None,
+        db_path: Optional[Union[str, Path]] = None,
         timeout: float = 8.0,
         mirror_local: bool = True,
     ):
@@ -98,7 +142,8 @@ class RDNClient:
 
         # Node discovery priority:
         # 1. Explicit node_url param
-        # 2. Xchange mode (REASON_USE_XCHANGE=1 etc.) -> Railway broker (warf.astrognosy.com)
+        # 2. Network mode -> configure WARF Gateway plus Reason Registry while
+        #    preserving the local node/storage path.
         # 3. Env vars
         # 4. ~/.reason-ecosystem.cfg
         # 5. Local port file
@@ -107,17 +152,33 @@ class RDNClient:
         self.broker_url: Optional[str] = None
         self.xport_url: Optional[str] = None
 
+        config = self._load_config()
+        network_env_keys = (
+            "REASON_USE_NETWORK",
+            "REASON_USE_XCHANGE",
+            "USE_WARF_XCHANGE",
+            "REASON_XCHANGE",
+            "XCHANGE",
+        )
+        network_env_is_explicit = any(name in os.environ for name in network_env_keys)
+        configured_node = str(config.get("node_url") or "").rstrip("/")
+        configured_network = bool(config.get("network_enabled")) or (
+            configured_node == WARF_GATEWAY_URL
+        )
+
         if not self.node_url:
-            use_xchange = (
-                os.environ.get("REASON_USE_XCHANGE")
-                or os.environ.get("USE_WARF_XCHANGE")
-                or os.environ.get("REASON_XCHANGE")
-                or os.environ.get("XCHANGE")
+            use_network = (
+                env_flag(*network_env_keys)
+                if network_env_is_explicit
+                else configured_network
             )
-            if use_xchange and str(use_xchange).lower() not in ("0", "false", "no"):
-                self.broker_url = XCHANGE_BROKER_URL
-                self.xport_url = XPORT_URL
-                self.node_url = self.broker_url  # for simple remember/recall paths
+            if use_network:
+                self.broker_url = str(
+                    config.get("gateway_url") or XCHANGE_BROKER_URL
+                ).rstrip("/")
+                self.xport_url = str(
+                    config.get("registry_url") or XPORT_URL
+                ).rstrip("/")
 
         if not self.node_url:
             for key in ENV_NODE_KEYS:
@@ -126,8 +187,8 @@ class RDNClient:
                     self.node_url = val.rstrip("/")
                     break
 
-        if not self.node_url:
-            self.node_url = self._load_node_url_from_config()
+        if not self.node_url and configured_node != WARF_GATEWAY_URL:
+            self.node_url = configured_node or None
 
         if not self.node_url:
             self.node_url = self._discover_local_node_via_port()
@@ -153,35 +214,36 @@ class RDNClient:
             pass
         return None
 
-    def _load_node_url_from_config(self) -> Optional[str]:
-        """Load preferred node_url from ~/.reason-ecosystem.cfg (written by installer)."""
+    def _load_config(self) -> Dict[str, Any]:
+        """Load the installer config while keeping local and network routes distinct."""
         try:
             if CONFIG_FILE.exists():
                 cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                url = cfg.get("node_url")
-                if url:
-                    return str(url).rstrip("/")
+                if isinstance(cfg, dict):
+                    return cfg
         except Exception:
             pass
-        return None
+        return {}
 
     def _check_health(self) -> bool:
         if not self.node_url:
             return False
-        try:
-            if requests:
-                r = requests.get(f"{self.node_url}/api/health", timeout=self.timeout)
-                if r.ok:
-                    data = r.json()
-                    return data.get("status") == "ok"
-            elif urllib_request:
-                with urllib_request.urlopen(
-                    f"{self.node_url}/api/health", timeout=self.timeout
-                ) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    return data.get("status") == "ok"
-        except Exception:
-            pass
+        for path in ("/health", "/api/health"):
+            try:
+                if requests:
+                    r = requests.get(f"{self.node_url}{path}", timeout=self.timeout)
+                    if r.ok:
+                        data = r.json()
+                        return data.get("status") in {"ok", "healthy"}
+                elif urllib_request:
+                    with urllib_request.urlopen(
+                        f"{self.node_url}{path}", timeout=self.timeout
+                    ) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("status") in {"ok", "healthy"}:
+                            return True
+            except Exception:
+                continue
         return False
 
     def refresh_availability(self) -> bool:
@@ -227,8 +289,6 @@ class RDNClient:
     # ---------------- HTTP helpers ----------------
 
     def _http_get(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        if not self.node_url:
-            return None
         try:
             headers = self._auth_headers()
             if requests:
@@ -249,8 +309,6 @@ class RDNClient:
             return None
 
     def _http_post(self, url: str, payload: Dict[str, Any]) -> Optional[Dict]:
-        if not self.node_url:
-            return None
         try:
             headers = self._auth_headers()
             if requests:
@@ -269,6 +327,119 @@ class RDNClient:
             self.logger.debug("HTTP POST failed: %s", exc)
             return None
 
+    @staticmethod
+    def _decode_response_payload(response: Any) -> Any:
+        try:
+            return response.json()
+        except Exception:
+            text_value = getattr(response, "text", None)
+            return text_value if text_value not in {None, ""} else None
+
+    @staticmethod
+    def _http_error(status_code: int, payload: Any) -> RDNHTTPError:
+        if isinstance(payload, dict):
+            message = payload.get("detail") or payload.get("message") or payload.get("error")
+        else:
+            message = payload
+        message = str(message or "request failed")
+        error_types = {
+            401: RDNAuthorizationError,
+            403: RDNAuthorizationError,
+            404: RDNNotFoundError,
+            409: RDNConflictError,
+            503: RDNUnavailableError,
+        }
+        error_type = error_types.get(int(status_code), RDNHTTPError)
+        return error_type(int(status_code), message, payload)
+
+    def _http_get_strict(
+        self, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """GET JSON without collapsing HTTP status or transport failures."""
+        headers = self._auth_headers()
+        if requests:
+            try:
+                response = requests.get(
+                    url, params=params, headers=headers, timeout=self.timeout
+                )
+            except Exception as exc:
+                raise RDNTransportError(f"GET {url} failed: {exc}") from exc
+            payload = self._decode_response_payload(response)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status_code < 300:
+                raise self._http_error(status_code, payload)
+            if not isinstance(payload, dict):
+                raise RDNTransportError(f"GET {url} returned a non-object JSON response")
+            return payload
+
+        if urllib_request:
+            from urllib.parse import urlencode
+
+            if params:
+                url = f"{url}?{urlencode(params)}"
+            request = urllib_request.Request(url, headers=headers)
+            try:
+                with urllib_request.urlopen(request, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except urllib_error.HTTPError as exc:  # type: ignore[union-attr]
+                try:
+                    error_payload = json.loads(exc.read().decode("utf-8"))
+                except Exception:
+                    error_payload = None
+                raise self._http_error(int(exc.code), error_payload) from exc
+            except Exception as exc:
+                raise RDNTransportError(f"GET {url} failed: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise RDNTransportError(f"GET {url} returned a non-object JSON response")
+            return payload
+        raise RDNTransportError("No HTTP client is available")
+
+    def _http_post_strict(
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        *,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """POST JSON without collapsing HTTP status or transport failures."""
+        request_headers = self._auth_headers() if headers is None else dict(headers)
+        if requests:
+            try:
+                response = requests.post(
+                    url, json=payload, headers=request_headers, timeout=self.timeout
+                )
+            except Exception as exc:
+                raise RDNTransportError(f"POST {url} failed: {exc}") from exc
+            response_payload = self._decode_response_payload(response)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status_code < 300:
+                raise self._http_error(status_code, response_payload)
+            if not isinstance(response_payload, dict):
+                raise RDNTransportError(f"POST {url} returned a non-object JSON response")
+            return response_payload
+
+        if urllib_request:
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            request = urllib_request.Request(
+                url, data=data, method="POST", headers=request_headers
+            )
+            request.add_header("Content-Type", "application/json")
+            try:
+                with urllib_request.urlopen(request, timeout=self.timeout) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
+            except urllib_error.HTTPError as exc:  # type: ignore[union-attr]
+                try:
+                    error_payload = json.loads(exc.read().decode("utf-8"))
+                except Exception:
+                    error_payload = None
+                raise self._http_error(int(exc.code), error_payload) from exc
+            except Exception as exc:
+                raise RDNTransportError(f"POST {url} failed: {exc}") from exc
+            if not isinstance(response_payload, dict):
+                raise RDNTransportError(f"POST {url} returned a non-object JSON response")
+            return response_payload
+        raise RDNTransportError("No HTTP client is available")
+
     def _auth_headers(self) -> Dict[str, str]:
         token = (
             os.environ.get("REASON_RDN_TOKEN")
@@ -280,37 +451,85 @@ class RDNClient:
             return {"Authorization": f"Bearer {token}"}
         return {}
 
+    @staticmethod
+    def _admission_headers() -> Dict[str, str]:
+        """Use the Registry write credential without conflating WARF bearer auth."""
+        token = os.environ.get("REASON_REGISTRY_API_KEY") or os.environ.get(
+            "XPORT_API_KEY"
+        )
+        return {"X-API-Key": token} if token else {}
+
     # ------------------------------------------------------------------
-    # Xchange / reason:// helpers (public bridge to warf.astrognosy.com)
+    # WARF / reason:// helpers (public Gateway and Reason Registry bridge)
     # ------------------------------------------------------------------
 
-    def resolve_reason_uri(self, uri: str, bypass_cache: bool = False) -> Optional[Dict[str, Any]]:
+    def resolve_reason_uri(
+        self,
+        uri: str,
+        bypass_cache: bool = False,
+        version: Optional[str] = None,
+    ) -> ReasonArtifact:
+        """Compatibility alias for explicit Reason Registry resolution."""
+        return self.resolve_from_registry(
+            uri, bypass_cache=bypass_cache, version=version
+        )
+
+    def _resolve_reason_uri_at(
+        self,
+        target: str,
+        uri: str,
+        bypass_cache: bool = False,
+        version: Optional[str] = None,
+    ) -> ReasonArtifact:
+        """Resolve and verify one artifact at one exact Registry endpoint."""
+        canonical_address = validate_reason_address(uri)
+        params: Dict[str, Any] = {"address": canonical_address}
+        if version is not None:
+            params["version"] = version
+        if bypass_cache:
+            params["bypass_cache"] = True
+        data = self._http_get_strict(f"{target.rstrip('/')}/resolve", params=params)
+        artifact = parse_reason_artifact(data, source="registry")
+        if artifact.address != canonical_address:
+            raise ArtifactValidationError(
+                "Registry returned an artifact for a different reason address"
+            )
+        if version is not None and artifact.version != version:
+            raise ArtifactValidationError(
+                "Registry returned a different artifact version than requested"
+            )
+        return artifact
+
+    def share_to_network(
+        self,
+        content: str,
+        uri: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        project: str = "astrognosy",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Deprecated 0.5 compatibility call for the legacy single-handoff route.
+
+        New code uses :meth:`network_arbitrate` followed by :meth:`admit`.
+        This method is not advertised by the CLI or MCP surface.
         """
-        Resolve a reason:// URI against an Xchange/Xport-compatible node.
-
-        Returns the artifact if the node supports the reason:// registry protocol.
-
-        Falls back gracefully if the node only speaks the simpler /api/resolve.
-        """
-        if not self.node_url:
-            return None
-
-        # Try the advanced Xport-style endpoint first (used by the real warf Xchange)
-        try:
-            from urllib.parse import quote as urlquote
-            encoded = urlquote(uri, safe="")
-            # The monowarfo/warf nodes support /resolve?address=reason://...
-            url = f"{self.node_url}/resolve?address={encoded}"
-            if bypass_cache:
-                url += "&bypass_cache=true"
-            data = self._http_get(url)
-            if data:
-                return data
-        except Exception:
-            pass
-
-        # Fallback to our simpler API (local node or compatible Xchange)
-        return self.resolve(uri)  # our resolve accepts address too
+        target = self.broker_url or WARF_GATEWAY_URL
+        details = dict(meta or {})
+        payload: Dict[str, Any] = {
+            "query_text": details.get("query_text") or "Retain this agent handoff for reuse.",
+            "agent_id": project,
+            "answer_text": content,
+            "corpus": details.get("corpus") or [],
+        }
+        if uri:
+            payload["reason_address"] = uri
+        result = self._http_post(f"{target.rstrip('/')}/share", payload)
+        return result or {
+            "status": "unavailable",
+            "target": target,
+            "route": "/share",
+            "local_copy_retained": False,
+        }
 
     def share_to_xchange(
         self,
@@ -320,28 +539,171 @@ class RDNClient:
         project: str = "astrognosy",
         meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Deposit an artifact and mark it for the warf Xchange.
-
-        When Xchange mode is active (or node_url points at the broker), this goes
-        to the public broker. Any scoring, arbitration, or promotion happens
-        behind that broker boundary.
-
-        Returns the deposit result.
-        """
-        if meta is None:
-            meta = {}
-        if uri:
-            meta["reason_uri"] = uri
-        meta.setdefault("xchange_share", True)
-        meta.setdefault("submitted_via", "ReasonRDN")
-
-        return self.remember(
+        """Deprecated 0.5 compatibility alias for :meth:`share_to_network`."""
+        return self.share_to_network(
             content=content,
-            tags=tags or ["handoff", "xchange", "share"],
+            uri=uri,
+            tags=tags,
             project=project,
             meta=meta,
         )
+
+    def network_arbitrate(
+        self,
+        query_text: str,
+        packages: List[Dict[str, Any]],
+        reason_address: Optional[str] = None,
+        query_id: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Submit competing packages to the public WARF Gateway."""
+        if len(packages) < 2:
+            raise ValueError(
+                "WARF arbitration requires at least two submissions; "
+                "retain one handoff locally until it has a competing arbitration package"
+            )
+        target = self.broker_url or WARF_GATEWAY_URL
+        semantic_request: Dict[str, Any] = {
+            "query_text": query_text,
+            "packages": packages,
+        }
+        if reason_address:
+            semantic_request["reason_address"] = reason_address
+
+        reserved = {"query_id", "query_text", "packages", "reason_address"}
+        semantic_request.update(
+            {
+                key: value
+                for key, value in kwargs.items()
+                if key not in reserved and value is not None
+            }
+        )
+        stable_query_id = query_id or "rdn-" + hashlib.sha256(
+            json.dumps(
+                semantic_request,
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        payload: Dict[str, Any] = {
+            "query_id": stable_query_id,
+            **semantic_request,
+        }
+
+        result = self._http_post(f"{target.rstrip('/')}/arbitrate", payload)
+        return result or {
+            "status": "unavailable",
+            "target": target,
+            "route": "/arbitrate",
+            "query_id": stable_query_id,
+        }
+
+    def admit(
+        self,
+        artifact: Union[ReasonArtifact, Mapping[str, Any]],
+        arbitration: Mapping[str, Any],
+        *,
+        expected_current_version: Optional[str] = None,
+    ) -> ReasonArtifact:
+        """Explicitly request arbitration-backed Reason Registry admission.
+
+        Remembering, resolving, and arbitrating never call this method.  The
+        caller supplies the exact selected Gateway event and its audit hash.
+        """
+        candidate = (
+            artifact
+            if isinstance(artifact, ReasonArtifact)
+            else parse_reason_artifact(artifact, source="local")
+        )
+        if not isinstance(arbitration, Mapping):
+            raise ArtifactValidationError("arbitration must be a JSON object")
+        arbitration_data = dict(arbitration)
+        required_arbitration_fields = {
+            "query_id",
+            "winner_submission_id",
+            "event_record",
+            "audit_hash",
+        }
+        if set(arbitration_data) != required_arbitration_fields:
+            raise ArtifactValidationError(
+                "arbitration must contain exactly query_id, winner_submission_id, "
+                "event_record, and audit_hash"
+            )
+        query_id = arbitration_data.get("query_id")
+        winner_submission_id = arbitration_data.get("winner_submission_id")
+        event_record = arbitration_data.get("event_record")
+        audit_hash = arbitration_data.get("audit_hash")
+        if not isinstance(query_id, str) or not query_id:
+            raise ArtifactValidationError("arbitration.query_id must be a non-empty string")
+        if not isinstance(winner_submission_id, str) or not winner_submission_id:
+            raise ArtifactValidationError(
+                "arbitration.winner_submission_id must be a non-empty string"
+            )
+        if not isinstance(event_record, dict):
+            raise ArtifactValidationError("arbitration.event_record must be a JSON object")
+        if event_record.get("schema") != EVENT_RECORD_SCHEMA:
+            raise ArtifactValidationError(
+                f"arbitration.event_record.schema must be {EVENT_RECORD_SCHEMA!r}"
+            )
+        if event_record.get("query_id") != query_id:
+            raise ArtifactValidationError(
+                "arbitration.query_id must match event_record.query_id"
+            )
+        if event_record.get("winner") != winner_submission_id:
+            raise ArtifactValidationError(
+                "arbitration.winner_submission_id must match event_record.winner"
+            )
+        if not isinstance(audit_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", audit_hash):
+            raise ArtifactValidationError(
+                "arbitration.audit_hash must be a lowercase 64-character SHA-256 digest"
+            )
+        computed_audit = hashlib.sha256(rfc8785.dumps(event_record)).hexdigest()
+        if not hmac.compare_digest(computed_audit, audit_hash):
+            raise ArtifactValidationError(
+                "arbitration.audit_hash does not match the canonical event record"
+            )
+
+        canonical = candidate.to_dict()
+        artifact_request = {
+            key: canonical[key]
+            for key in (
+                "address",
+                "media_type",
+                "content",
+                "content_digest",
+                "content_digest_algorithm",
+                "canonical_encoding",
+            )
+        }
+        payload: Dict[str, Any] = {
+            "artifact": artifact_request,
+            "arbitration": arbitration_data,
+        }
+        if expected_current_version is not None and not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(expected_current_version)
+        ):
+            raise ArtifactValidationError(
+                "expected_current_version must be null or sha256:<64 lowercase hex>"
+            )
+        payload["expected_current_version"] = expected_current_version
+
+        target = self.xport_url or REASON_REGISTRY_URL
+        response = self._http_post_strict(
+            f"{target.rstrip('/')}/admissions",
+            payload,
+            headers=self._admission_headers(),
+        )
+        admitted = parse_reason_artifact(response, source="registry")
+        if admitted.address != candidate.address:
+            raise ArtifactValidationError(
+                "Registry admitted a different reason address than requested"
+            )
+        if admitted.content_digest != candidate.content_digest:
+            raise ArtifactValidationError(
+                "Registry admitted different content than requested"
+            )
+        return admitted
 
     def xchange_arbitrate(
         self,
@@ -350,50 +712,27 @@ class RDNClient:
         reason_address: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Submit packages for Xchange arbitration (full flow).
+        """Compatibility alias for :meth:`network_arbitrate`."""
+        return self.network_arbitrate(
+            query_text=query_text,
+            packages=packages,
+            reason_address=reason_address,
+            **kwargs,
+        )
 
-        This is the high-level way to submit packages to the public broker.
+    def resolve_from_registry(self, uri: str, **kwargs) -> ReasonArtifact:
+        """Resolve a reason:// URI through the configured Reason Registry."""
+        target = self.xport_url or REASON_REGISTRY_URL
+        return self._resolve_reason_uri_at(target, uri, **kwargs)
 
-        The broker handles arbitration and any downstream promotion to the
-        reason:// registry.
-
-        packages should be list of dicts with at least 'agent_id' and 'answer_text'.
-        (Matches the advanced XchangePackage shape used by the reference broker.)
-
-        Returns the arbitration result (winner, scores, audit_hash, possible promotion info).
-        """
-        # Use broker if we have it, else current node_url
-        target = self.broker_url or self.node_url or XCHANGE_BROKER_URL
-        if not target:
-            raise RuntimeError("No Xchange broker configured for arbitration.")
-
-        payload = {
-            "query_text": query_text,
-            "packages": packages,
-        }
-        if reason_address:
-            payload["reason_address"] = reason_address
-
-        # The public broker endpoint for full arbitration (from reference)
-        url = f"{target.rstrip('/')}/v1/warf/xchange"
-        result = self._http_post(url, payload)
-        return result or {"status": "submitted", "target": target}
-
-    def resolve_from_xport(self, uri: str, **kwargs) -> Optional[Dict[str, Any]]:
+    def resolve_from_xport(self, uri: str, **kwargs) -> ReasonArtifact:
         """
         Resolve a reason:// URI from the registry side after broker processing.
 
         Uses the xport_url if configured (reason.astrognosy.com), otherwise falls back.
         This is the public registry path in the full architecture.
         """
-        target = self.xport_url or self.node_url or XPORT_URL
-        # Try advanced resolve first
-        try:
-            return self.resolve_reason_uri(uri, **kwargs)
-        except Exception:
-            # Fallback to simple resolve on the same target
-            return self.resolve(uri) if hasattr(self, 'resolve') else None
+        return self.resolve_from_registry(uri, **kwargs)
 
     def list_prefix(self, prefix: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
@@ -663,21 +1002,41 @@ class RDNClient:
 
         return results
 
-    def resolve(self, address: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single artifact by its exact reason:// address."""
-        if not address:
-            return None
+    def resolve(
+        self,
+        address: str,
+        *,
+        source: str = "local",
+        version: Optional[str] = None,
+        bypass_cache: bool = False,
+    ) -> Optional[ReasonArtifact]:
+        """Resolve from exactly one selected source; local is the default."""
+        canonical_address = validate_reason_address(address)
+        if source == "registry":
+            return self.resolve_from_registry(
+                canonical_address,
+                version=version,
+                bypass_cache=bypass_cache,
+            )
+        if source != "local":
+            raise ValueError("source must be 'local' or 'registry'")
 
         if self.node_url and self.available:
             res = self._http_get(
-                f"{self.node_url}/api/resolve", params={"address": address}
+                f"{self.node_url}/api/resolve", params={"address": canonical_address}
             )
             if res and res.get("status") == "ok":
                 # Server now consistently returns "artifact"
                 art = res.get("artifact") or res.get("result")
                 if art:
-                    art.setdefault("source", "node")
-                    return art
+                    parsed = parse_reason_artifact(art, source="local")
+                    if version is not None and parsed.version != version:
+                        raise RDNConflictError(
+                            409,
+                            "local artifact version does not match the requested version",
+                            {"address": canonical_address, "version": parsed.version},
+                        )
+                    return parsed
 
         # Local
         conn = self._get_conn()
@@ -685,20 +1044,28 @@ class RDNClient:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts WHERE address = ?",
-                (address,),
+                (canonical_address,),
             ).fetchone()
             if not row:
                 return None
             meta = json.loads(row["metadata_json"])
-            return {
+            parsed = parse_reason_artifact({
                 "address": row["address"],
                 "project": row["domain"],
                 "deposited_at": row["deposited_at"],
                 "content": meta.get("content", ""),
                 "tags": meta.get("tags", []),
                 "meta": meta,
-                "source": "local",
-            }
+            }, source="local")
+            if version is not None and parsed.version != version:
+                raise RDNConflictError(
+                    409,
+                    "local artifact version does not match the requested version",
+                    {"address": canonical_address, "version": parsed.version},
+                )
+            return parsed
+        except (ArtifactValidationError, RDNConflictError):
+            raise
         except Exception as e:
             logger.error("Local resolve failed: %s", e)
             return None

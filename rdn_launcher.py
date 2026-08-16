@@ -21,7 +21,6 @@ import sys
 import webbrowser
 import time
 import subprocess
-import threading
 
 # Tray support (will be collected by PyInstaller when building with --collect-all pystray PIL)
 try:
@@ -116,12 +115,12 @@ def open_dashboard(dash_port=8501, node_port=8765):
     
     Note on ports (this is by design):
       - Node (memory API / "reason db"): localhost:{node_port}
-      - Dashboard (harness UI with metrics, suggestions, Xchange): localhost:{dash_port}
+      - Dashboard (harness UI with metrics and explicit WARF actions): localhost:{dash_port}
     """
     print(f"\n[rdn] Starting the ReasonRDN dashboard (Streamlit on :{dash_port})...")
     print(f"[rdn] Local private node (memory backend) is on :{node_port}")
     print("[rdn] This is your one-stop view: live metrics (token savings, velocity, ship rate, positive signals),")
-    print("[rdn] workflow suggestions, Xchange federation, reason:// explorer, visual fingerprints, etc.")
+    print("[rdn] workflow suggestions, WARF arbitration, reason:// explorer, visual fingerprints, etc.")
     
     cmd = get_streamlit_command()
     
@@ -189,7 +188,7 @@ def open_dashboard(dash_port=8501, node_port=8765):
             print(f"[rdn] Browser auto-open had an issue: {browser_err}")
         
         if opened:
-            print(f"[rdn] ✓ Opened the dashboard in your default browser.")
+            print("[rdn] ✓ Opened the dashboard in your default browser.")
         else:
             print(f"[rdn] Please manually visit: {dashboard_url}")
         
@@ -225,11 +224,15 @@ def create_tray_icon():
     def menu_quit(icon, item):
         global _node_proc, _mcp_proc
         if _node_proc:
-            try: _node_proc.terminate()
-            except: pass
+            try:
+                _node_proc.terminate()
+            except Exception:
+                pass
         if _mcp_proc:
-            try: _mcp_proc.terminate()
-            except: pass
+            try:
+                _mcp_proc.terminate()
+            except Exception:
+                pass
         icon.stop()
         sys.exit(0)
 
@@ -257,7 +260,7 @@ def main():
 Double-click (or run with no args / "start") does this automatically:
 • Starts the local private node (memory API / "reason db") on port 8765
 • Launches the ReasonRDN dashboard (metrics, token savings, velocity,
-  ship rate, positive signals, workflow suggestions, Xchange controls, etc.)
+  ship rate, positive signals, workflow suggestions, WARF network controls, etc.)
 • Tries very hard to open the dashboard in your browser
 • Shows a system tray icon for ongoing control (re-open dash, restart node, start/stop MCP, quit)
 
@@ -271,9 +274,8 @@ When you manually went to 8765 you saw the local node, which is also correct.
 The updated package.py below has much stronger --collect and --hidden-import flags so the next build should properly bundle streamlit + plotly and the dash should launch + auto-open reliably from the .exe.
 """)
 
-        # Auto-start node for the best immediate "just works" experience (unless user wants pure Xchange)
-        if not os.environ.get("REASON_USE_XCHANGE"):
-            start_local_node()
+        # Local memory remains available in every network configuration.
+        start_local_node()
 
         # Launch the visual dashboard.
         open_dashboard(dash_port=8501, node_port=8765)
@@ -290,7 +292,7 @@ The updated package.py below has much stronger --collect and --hidden-import fla
             print("[rdn] (Tray not available in this build. The dashboard should still be running.)")
             try:
                 input("\n[rdn] Press Enter when you're done (the dashboard keeps running in the browser)...")
-            except:
+            except Exception:
                 pass
         return
 
@@ -304,7 +306,7 @@ The updated package.py below has much stronger --collect and --hidden-import fla
         print("Try running the .exe with no arguments for the full dashboard experience.")
         try:
             input("Press Enter to exit...")
-        except:
+        except Exception:
             pass
 
 if __name__ == "__main__":

@@ -27,8 +27,8 @@ class ReasonRDN:
     Orchestrates high-utility, privacy-preserving handoffs between agents,
     sessions, and the desktop operator.
 
-    Uses a local artifact hash for integrity metadata. Network scoring,
-    arbitration, and promotion are handled by the configured broker.
+    Uses a local artifact hash for integrity metadata. Arbitration and optional
+    Registry admission are separate explicit operations.
     """
 
     def __init__(

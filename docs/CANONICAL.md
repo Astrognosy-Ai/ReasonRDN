@@ -1,38 +1,41 @@
-# ReasonRDN Canonical Note
+# ReasonRDN canonical boundary
 
-ReasonRDN is the public on-ramp for reason:// memory, local-first agent context, and deterministic arbitration workflows.
+ReasonRDN is the public local-first memory product and reason:// on-ramp for
+agents, developers, and teams.
 
 ## Owns
 
-- Local private memory node.
-- CLI, Python package, dashboard, and MCP tools.
-- reason:// addressing and prefix browsing.
-- Public bridge into Xchange/Reason workflows.
-- Local artifact integrity metadata.
-- Public implementation path aligned with active Datatracker Internet-Drafts.
+- Local memory, handoffs, and artifact integrity metadata.
+- Public Python, CLI, MCP, dashboard, and embedded-node UX.
+- reason:// parsing, local resolution, and explicit resolver selection.
+- The public client adapter for WARF arbitration, selected-result Registry
+  admission, and current or pinned Registry lookup.
+- `rdn/protocol-lock.json`, the single public SDK and MCP contract.
 
-## Does Not Own
+## Related owners
 
-- Protected scoring or promotion internals.
-- Current Railway broker/Xport deployment lineage; that is `monowarfo`.
-- Refinery or GnoSys implementation internals.
+- `monowarfo` owns the managed WARF Gateway, Reason Registry, deployment
+  configuration, and working next-revision RFCXML.
+- `astragnostic-api` owns protected scoring.
+- `warf-edge` owns private matching and action selection.
+- `xfer` owns private transfer technology for vertical products.
+- IETF Datatracker owns the submitted Internet-Draft record.
 
-## Test Command
+## Separation rules
+
+- Local is the default. Arbitration, admission, and Registry resolution are
+  separate explicit network actions.
+- reason:// addressing and local resolution do not require WARF.
+- Astrognosy's managed Registry admits only content bound to an exact retained,
+  selected WARF v2 event. Arbitration alone writes no Registry artifact.
+- `reason-py` is private compatibility only and does not define a second
+  artifact parser, version rule, or MCP contract.
+- A URI is an address, not proof of quality or one mandatory global registry.
+- Xchange and Xport remain compatibility identifiers, not separate products.
+- Do not copy protected scoring or deployment internals into this public repo.
+
+## Check
 
 ```powershell
-py -3.13 -m pytest -q
+python -m pytest -q
 ```
-
-## Public Boundary
-
-This repo is intentionally public and thin. It may describe the architecture and provide client tools, but it must not absorb protected scoring, model-control, or sensing internals from private repos.
-
-## IETF Context
-
-The related active Internet-Drafts are:
-
-- https://datatracker.ietf.org/doc/draft-westerbeck-reason-protocol/
-- https://datatracker.ietf.org/doc/draft-westerbeck-warf-protocol/
-- https://datatracker.ietf.org/person/jacob%40pcfic.com
-
-Use "active Internet-Draft" or "IETF-track protocol work" language. Do not imply RFC approval.

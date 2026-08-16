@@ -12,10 +12,10 @@ One-command installer for the ReasonRDN shared memory substrate:
 - Automatic MCP registration for agents (Claude, Grok, Cursor, etc.)
 
 Usage (from the ReasonRDN root):
-  py -3.13 install.py
-  py -3.13 install.py --no-service          # skip windows integration
-  py -3.13 install.py --agent-only          # just the memory + MCP bits
-  py -3.13 install.py --build               # also build the ReasonRDN.exe
+  python install.py
+  python install.py --no-service          # skip windows integration
+  python install.py --agent-only          # just the memory + MCP bits
+  python install.py --build               # also build the ReasonRDN.exe
 
 After install you get working:
   import rdn
@@ -30,11 +30,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional, Tuple
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -76,7 +76,7 @@ def install_core():
     return True
 
 
-def start_private_node(port: int, storage: str) -> tuple[int | None, int]:
+def start_private_node(port: int, storage: str) -> Tuple[Optional[int], int]:
     """Start the embedded node using the new coherent -m entrypoint.
     Returns (PID, actual_port). The node may bind a different port if the
     requested one is in use; we always return the one it actually used.
@@ -111,8 +111,12 @@ def start_private_node(port: int, storage: str) -> tuple[int | None, int]:
     return proc.pid, port
 
 
-def create_unified_config(port: int, node_url: str | None = None):
-    """Create ~/.reason-ecosystem.cfg pointing at the private (or supplied) node."""
+def create_unified_config(
+    port: int,
+    node_url: Optional[str] = None,
+    network_enabled: bool = False,
+):
+    """Create a local-node config plus an optional explicit WARF network selection."""
     print("\n=== Writing unified config ===")
     if node_url is None:
         node_url = f"http://127.0.0.1:{port}"
@@ -120,6 +124,9 @@ def create_unified_config(port: int, node_url: str | None = None):
     config = {
         "version": "2.0",
         "node_url": node_url,
+        "network_enabled": network_enabled,
+        "gateway_url": "https://warf.astrognosy.com",
+        "registry_url": "https://reason.astrognosy.com",
         "port": port,
         "private_storage": str(HOME / ".reason-rdn" / "private-node"),
         "memory_db": str(HOME / ".reason-rdn" / "private-node" / "warf-node.db"),
@@ -223,7 +230,7 @@ ReasonRDN:
 
     # Print PATH hint so rdn / rdn-start etc. work in the current shell
     scripts_dir = str(HOME / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "Scripts")
-    print(f"\nNOTE: If 'rdn' command is not found in this PowerShell session, run:")
+    print("\nNOTE: If 'rdn' command is not found in this PowerShell session, run:")
     print(f'  $env:Path = "{scripts_dir};" + $env:Path')
     print("  (For permanent fix, add that Scripts folder to your user PATH in System Properties > Environment Variables.)")
 
@@ -236,9 +243,10 @@ def main(argv=None):
     parser.add_argument("--no-service", action="store_true", help="Skip Windows Task Scheduler / shim integration")
     parser.add_argument("--node-url", default=None, help="Use a remote/shared node instead of starting a private one")
     parser.add_argument(
-        "--xchange", "--use-xchange", action="store_true",
-        help="Configure auto-deposit to the warf Xchange reference broker (https://warf.astrognosy.com on Railway). "
-             "Deposits flow through the broker for possible promotion to the reason:// registry."
+        "--network", "--use-network", "--xchange", "--use-xchange",
+        dest="network", action="store_true",
+        help="Configure the optional WARF Gateway and Reason Registry. The local node remains primary; "
+             "the Xchange names remain compatibility aliases."
     )
     args = parser.parse_args(argv)
 
@@ -249,15 +257,14 @@ def main(argv=None):
         effective_node_url = args.node_url
         effective_port = args.port
 
-        if args.xchange:
-            effective_node_url = "https://warf.astrognosy.com"
-            print("\n*** Configuring for warf Xchange (https://warf.astrognosy.com) ***")
-            print("    Reasoning artifacts will auto-deposit to the central exchange (with local mirror if enabled).")
-            print("    For authenticated access set REASON_RDN_TOKEN (or RDN_AUTH_TOKEN) in your environment.")
-            print("    Local private node startup is skipped when using --xchange (you can still run one manually).")
+        if args.network:
+            print("\n*** Configuring optional WARF network access ***")
+            print("    Local memory remains primary. This records available Gateway and Registry endpoints.")
+            print("    Arbitration, admission, and Registry resolution still require an explicit action.")
+            print("    For admission set REASON_REGISTRY_API_KEY in your environment.")
 
         if not args.agent_only:
-            # Start a private node for local-first (unless remote/Xchange provided)
+            # Start a private node for local-first unless a custom compatible node was supplied.
             if effective_node_url:
                 print(f"\nUsing remote node: {effective_node_url}")
             else:
@@ -266,8 +273,12 @@ def main(argv=None):
                 effective_port = actual_port
             time.sleep(0.8)
 
-        # Always create the unified config (with Xchange or provided URL)
-        config = create_unified_config(effective_port, effective_node_url)
+        # Always create the unified config with a local/custom node and optional network endpoints.
+        config = create_unified_config(
+            effective_port,
+            effective_node_url,
+            network_enabled=args.network,
+        )
 
         # Register MCP for agents
         register_mcp()
@@ -276,8 +287,7 @@ def main(argv=None):
         print(f"Config: {CONFIG_FILE}")
         print(f"Node URL: {config['node_url']}")
         print(f"Local DB:   {config['memory_db']}")
-        if "warf.astrognosy.com" in str(config.get("node_url", "")):
-            print("    (warf Xchange broker configured)")
+        print(f"WARF network: {'configured' if config['network_enabled'] else 'not selected'}")
 
         print("\n" + "="*70)
         print("🚀 THE EASY 'START USING RDN' (HERO PATH - RELIABLE, CROSS-PLATFORM)")
@@ -290,7 +300,7 @@ def main(argv=None):
 You're running from the local source tree.
 
 To get the full experience (dashboard + real token metrics + extras) right now:
-  py -3.13 -m pip install -e '.[full]'
+  python -m pip install -e '.[full]'
   rdn start
 
 (The published one-liner below will work once reason-rdn is on PyPI.)
@@ -305,7 +315,7 @@ The primary, reliable way (no bundling issues):
 This launches the harness dashboard with:
 - Live metrics (token savings, velocity, ship rate, positive signals)
 - Workflow suggestions
-- Xchange controls and reason:// explorer
+- WARF network controls and reason:// explorer
 - A coherent on-ramp experience for local memory and broker participation
 
 Tell agents: "install reason-rdn[full] and run rdn start"   (or the local -e version above)
@@ -328,13 +338,13 @@ See the full one-liner, ports (8765=node, 8501=dash), and EXE notes in README.md
         print("  rdn remember \"Fixed the race condition in sync\" --tags infra,bugfix")
         print("  rdn recall \"race condition\"")
         print("  rdn status")
-        print("  rdn --xchange recall \"handoff\"     # explicitly target the Xchange")
+        print("  rdn --network resolve reason://ops/deployment/rollback-plan")
         print("  rdn-sync --once --install-hooks")
         print("  rdn-node")
         print("  rdn-mcp")
 
-        if "warf.astrognosy.com" in str(config.get("node_url", "")):
-            print("\n  To also use the Xchange from agents: set REASON_USE_XCHANGE=1 or pass --xchange to tools.")
+        if config.get("network_enabled"):
+            print("\n  WARF endpoints are configured. Local remains the default until a network action is selected.")
 
         # Optional build - the modern one-stop .exe (CLI + dashboard)
         if args.build:
@@ -377,13 +387,14 @@ The easiest way:
   rdn start
 
 Instantly gained:
-• Model-agnostic persistent memory (local + full warf Xchange)
-• Auto-deposit through the broker (warf.astrognosy.com) toward reason:// Xport
+• Model-agnostic persistent local memory
+• Explicit WARF Gateway arbitration and selected-result Registry admission
+• Stable current or pinned reason:// resolution through the Reason Registry
 • Artifact metadata + live harness metrics (tokens saved, velocity, ship rate, positive signals)
 • Workflow suggestions that improve how you actually ship
-• Dashboard for local memory, broker status, and reason:// browsing
+• Dashboard for local memory, WARF network status, and reason:// browsing
 
-This is the coherent agnostic harness. One memory layer. Every agent. Forever.
+This is the coherent agent handoff layer: local first, network when useful.
 """)
 
         return args
