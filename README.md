@@ -1,39 +1,36 @@
 # ReasonRDN
 
-**Local-first memory and reason:// handoffs for agents, developers, and teams.**
+**Local-first memory and verifiable handoffs for agents.**
 
-ReasonRDN gives agents durable context across sessions. It stores useful
-handoffs locally, exposes them through a small Python/CLI/MCP surface, and can
-optionally share selected artifacts through the public WARF broker.
+ReasonRDN lets agents keep useful decisions across sessions, assign stable
+`reason://` addresses, and explicitly use WARF when competing submissions need
+arbitration.
 
 ```powershell
 pip install 'reason-rdn[full]'
 rdn start
 ```
 
-## Why reason:// Exists
+## The problem it solves
 
-Agentic workflows lose time when every session has to rediscover the same
-decisions, fixes, and operating context. `reason://` gives that work a stable
-address.
+Agents can call tools through MCP and follow repository instructions through
+AGENTS.md, but useful work still disappears between runs. The next agent often
+has to rediscover what was decided, where the evidence came from, and which
+artifact is current.
 
-- Deposit reusable context once.
-- Resolve it later from the same agent, another agent, or a future session.
-- Work locally by default.
-- Opt in to network participation through the public broker when useful.
+ReasonRDN provides the handoff layer:
 
-This repo is the public on-ramp. It includes the local node, client, CLI,
-dashboard, MCP server, artifact metadata, and broker/Xport client paths. It does
-not include private scoring, arbitration, ranking, or promotion internals.
+- Remember context locally by default.
+- Give reusable work a stable `reason://authority/category/task` address.
+- Resolve it later from an explicit local or network registry.
+- Submit competing candidates to WARF and retain the decision record.
+- Keep network participation opt-in.
 
-## Quick Start
+## Quick start
 
 ```bash
-rdn remember "Fixed the critical auth race under load" --tags infra,auth
-rdn recall "auth race"
-rdn resolve "reason://infra/auth/race-detection"
-rdn --xchange status
-rdn list reason://infra
+rdn remember "Fixed the deployment race" --tags infra,deploy
+rdn recall "deployment race"
 ```
 
 Python:
@@ -42,116 +39,157 @@ Python:
 import rdn as reason
 
 reason.remember(
-    "The canonical solution for this class of outage",
-    tags=["infra", "outage", "ecs"],
-    reason_address="reason://ops/ecs/failures",
+    "Pause writes, restore, verify, then switch traffic.",
+    tags=["ops", "rollback"],
+    reason_address="reason://ops/deployment/rollback-plan",
 )
 
-artifact = reason.resolve("reason://ops/ecs/failures")
-print(artifact)
+artifact = reason.resolve("reason://ops/deployment/rollback-plan")
+assert artifact.source == "local"
 ```
-
-## Features
-
-- Local private node with SQLite fallback.
-- CLI commands for remember, recall, resolve, prefix browsing, status, and start.
-- MCP server so coding agents can remember and resolve project context.
-- Streamlit dashboard for local memory, token savings, and reason:// browsing.
-- Optional Xchange mode through `https://warf.astrognosy.com`.
-- Xport resolution through `https://reason.astrognosy.com`.
-- Simple artifact integrity metadata for local handoffs.
-
-## Public Architecture
-
-```text
-Your code / CLI / Dashboard / MCP agents
-        |
-        v
-Local ReasonRDN node
-        |
-        | optional Xchange mode
-        v
-Public WARF broker
-https://warf.astrognosy.com
-        |
-        v
-reason:// registry / Xport
-https://reason.astrognosy.com
-```
-
-The broker is the public network boundary. This package does not expose the
-private services or implementation details behind that boundary.
-
-## Configuration
-
-Turn on broker participation:
-
-```bash
-REASON_USE_XCHANGE=1 rdn start
-```
-
-Or for a single command:
-
-```bash
-rdn --xchange remember "Reusable deployment note" --project ops --tags ecs,deploy
-```
-
-Common environment variables:
-
-- `REASON_USE_XCHANGE=1`: send selected operations to the public broker.
-- `REASON_NODE_URL=...`: point at a local or remote compatible node.
-- `REASON_RDN_TOKEN=...`: optional bearer token for authenticated deployments.
 
 Local data lives under `~/.reason-rdn/`.
 
-## IETF Context
+## Managed round trip
 
-The canonical public Internet-Draft records live on IETF Datatracker:
+The complete network path is explicit and reversible:
 
-- [draft-westerbeck-reason-protocol](https://datatracker.ietf.org/doc/draft-westerbeck-reason-protocol/)
-- [draft-westerbeck-warf-protocol](https://datatracker.ietf.org/doc/draft-westerbeck-warf-protocol/)
-- [Jacob Westerbeck Datatracker profile](https://datatracker.ietf.org/person/jacob%40pcfic.com)
+```python
+from rdn import RDNClient, ReasonArtifact
 
-These are active Internet-Drafts, not RFCs. This repository links to the
-official Datatracker records instead of carrying local draft text.
+address = "reason://ops/deployment/rollback-plan"
+client = RDNClient()
 
-## Repository Layout
+# 1. Local retention never publishes.
+client.remember(
+    "We need a rollback plan that preserves data integrity.",
+    project="ops",
+    reason_address=address,
+)
+
+answers = {
+    "candidate-a": "Pause writes, restore, verify, then switch traffic.",
+    "candidate-b": "Switch traffic immediately.",
+}
+evidence = "The runbook requires verification before traffic changes."
+
+# 2. Arbitration compares candidates and retains an event. It does not admit.
+decision = client.network_arbitrate(
+    "Choose the safest rollback plan.",
+    [
+        {
+            "agent_id": candidate_id,
+            "answer_text": answer,
+            "corpus": [{"doc_id": "runbook", "text": evidence}],
+        }
+        for candidate_id, answer in answers.items()
+    ],
+    reason_address=address,
+)
+
+if decision["status"] == "selected":
+    selected = answers[decision["winner_submission_id"]]
+    artifact = ReasonArtifact.from_dict(
+        {
+            "address": address,
+            "media_type": "text/plain; charset=utf-8",
+            "content": selected,
+        },
+        source="local",
+    )
+    custody = {
+        "query_id": decision["query_id"],
+        "winner_submission_id": decision["winner_submission_id"],
+        "event_record": decision["event_record"],
+        "audit_hash": decision["audit_hash"],
+    }
+
+    # 3. Null is create-only. Updates name the exact prior sha256: version.
+    admitted = client.admit(
+        artifact,
+        custody,
+        expected_current_version=None,
+    )
+
+    # 4. Pinning the returned version resolves the same immutable bytes.
+    pinned = client.resolve(
+        address,
+        source="registry",
+        version=admitted.version,
+    )
+    assert pinned.to_dict() == admitted.to_dict()
+```
+
+Only three operations use the managed network: `arbitrate`, `admit`, and
+`resolve(..., source="registry")`. Remember, recall, and default resolution stay
+local. There is no automatic fallback, publication, or admission.
+
+Managed endpoints:
+
+- `https://warf.astrognosy.com` is the WARF Gateway.
+- `https://reason.astrognosy.com` is the Reason Registry.
+- `https://xport.astrognosy.com` remains a compatibility hostname.
+
+The former Xchange and Xport names remain hidden compatibility aliases. New
+applications use arbitration, admission, Gateway, and Registry language.
+
+## One SDK and MCP lock
+
+`reason-rdn` 0.5 and `rdn/protocol-lock.json` own the public artifact shape,
+address grammar, parser, version identity, and MCP contract. The advertised MCP
+tools are exactly `remember`, `recall`, `resolve`, `arbitrate`, `admit`, and
+`status`. The private `reason-py` package is a compatibility facade and delegates
+canonical parsing to this lock.
+
+## Components
 
 ```text
-rdn/
-  client.py              Unified local/broker client
-  reason.py              High-level Python API and harness metrics
-  cli.py                 Command line interface
-  dash.py                Dashboard
-  handoff/
-    fingerprint.py       Local artifact integrity hash helper
-    protocol.py          Handoff deposit/resolve orchestration
-    sync.py              Repository state sync helper
-  mcp/
-    server.py            MCP server for agent tools
-  node/
-    server.py            Local embedded memory node
-examples/
-  README.md              Usage examples
-ietf-drafts/
-  README.md              Official Datatracker links
+rdn/client.py          local and network client
+rdn/reason.py          high-level Python API
+rdn/cli.py             command line interface
+rdn/mcp/server.py      MCP tools
+rdn/node/server.py     embedded local memory node
+rdn/dash.py            optional dashboard
+rdn/handoff/           fingerprints and repository handoffs
 ```
+
+## How the ecosystem fits together
+
+ReasonRDN is the local memory and client layer. The WARF Gateway and Reason
+Registry provide managed arbitration and resolution; the WARF Scoring Service
+supplies selected scoring profiles; WARF Edge adds matching and action
+selection; and Xfer powers domain-specific verticals.
+
+Applications can start with ReasonRDN alone and add WARF arbitration when a
+handoff has competing submissions. A `reason://` URI supplies the stable
+address. The Registry current pointer is convenient; a returned `sha256:`
+version pins immutable content and validation bytes.
+
+## IETF work
+
+The submitted versions remain authoritative on IETF Datatracker:
+
+- [reason:// draft](https://datatracker.ietf.org/doc/draft-westerbeck-reason-protocol/)
+- [WARF draft](https://datatracker.ietf.org/doc/draft-westerbeck-warf-protocol/)
+
+Working RFCXML and rendered artifacts for the next revisions are maintained
+with the reference network implementation and reviewed before submission. The
+current working revision is local and unsubmitted.
+
+## AAIF interoperability concept
+
+The focused open-source contribution is portable agent handoffs after a tool or
+workflow finishes. See
+[`docs/AAIF-INTEROPERABILITY.md`](docs/AAIF-INTEROPERABILITY.md) for the small
+cross-runtime demo and its boundary.
 
 ## Development
 
-```bash
+```powershell
 pip install -e '.[full]'
-py -3.13 -m pytest -q
+python -m pytest -q
 ```
-
-## Public Boundary
-
-ReasonRDN is intentionally public and thin. It owns local memory, reason://
-client workflows, CLI/MCP/dashboard ergonomics, and optional broker routing.
-
-It does not own private scoring engines, production promotion infrastructure,
-model-control internals, sensing internals, or protected implementation details.
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

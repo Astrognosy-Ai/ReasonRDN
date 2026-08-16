@@ -4,30 +4,34 @@ rdn/mcp/server.py
 MCP server exposing the unified ReasonRDN memory API as tools for Claude/Grok/Codex/etc.
 
 Tools:
-  - remember: Deposit content and local artifact metadata
-  - recall: Search by query string (+ project / limit)
-  - resolve: Fetch exact artifact by reason:// address
+  - remember / recall: Retain and search local memory
+  - resolve: Fetch one verified artifact from an explicit source
+  - arbitrate: Submit competing packages to the WARF Gateway
+  - admit: Publish one selected, event-backed artifact to the Reason Registry
+  - status: Inspect local state and configured endpoints without network action
 
 Usage (after `pip install -e .`):
   python -m rdn.mcp.server
   rdn-mcp
 
-Environment / config (for auto-deposit to warf Xchange or custom node):
-  REASON_USE_XCHANGE=1          # or USE_WARF_XCHANGE=1 → https://warf.astrognosy.com
+Environment / config (for explicit WARF network use or a custom node):
+  REASON_USE_NETWORK=1          # preferred; legacy Xchange variables remain supported
   REASON_NODE_URL=...
   RDN_NODE_URL=...
   The unified client loads from env + ~/.reason-ecosystem.cfg + local port file.
 
-To share reasoning artifacts ecosystem-wide, install with --xchange or set the env var.
+Network mutation is available only through explicit arbitrate and admit calls.
+Local ReasonRDN memory remains the default.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
-from pathlib import Path
+
+from rdn.artifact import MCP_ADVERTISED_TOOLS, ReasonArtifact
+from rdn.client import RDNClient, RDNHTTPError
 
 # Lazy MCP import so the core rdn package works without the optional extra
 _mcp_available = False
@@ -41,19 +45,34 @@ except ImportError:
     stdio_server = None
     CallToolResult = TextContent = Tool = None
 
-from rdn.client import RDNClient, XCHANGE_URL
+
+def _network_share_envelope(result: object) -> dict:
+    """Expose the actual network outcome without hiding a retained local copy."""
+    if not isinstance(result, dict):
+        return {"status": "error", "result": result}
+
+    reported = str(result.get("status") or "").strip().lower()
+    if reported in {"shared", "accepted", "ok", "success"}:
+        status = "shared"
+    elif reported:
+        status = reported
+    elif result.get("audit_hash") and result.get("winner"):
+        status = "shared"
+    else:
+        status = "unknown"
+    return {"status": status, "result": result}
 
 
 class WARFMCPServer:
-    """MCP server for ReasonRDN + warf Xchange.
+    """MCP server for ReasonRDN plus optional WARF networking.
 
-    Provides local persistent memory + one-command federation to the central
-    warf Xchange (https://warf.astrognosy.com) for ecosystem-wide verified artifacts.
+    Provides local persistent memory plus explicit WARF arbitration, selected
+    result admission, and Reason Registry resolution.
 
     Agents are instructed to:
       - resolve before re-reasoning on known problems
       - remember decisions worth preserving
-      - share high-value work to the Xchange (when configured)
+      - share selected high-value work through the Gateway (when configured)
     """
 
     def __init__(self):
@@ -62,10 +81,12 @@ class WARFMCPServer:
                 "MCP support not installed. Install with: pip install 'reason-rdn[mcp]' or 'reason-rdn[full]'"
             )
         self.server = Server("ReasonRDN")
-        self.memory = RDNClient()  # honors REASON_USE_XCHANGE, config, local port, etc.
+        self.memory = RDNClient()  # honors preferred and compatibility env names
         self._register_tools()
 
     def _text_result(self, payload, is_error: bool = False) -> CallToolResult:
+        if isinstance(payload, ReasonArtifact):
+            payload = payload.resolution_dict()
         text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
         return CallToolResult(
             content=[TextContent(type="text", text=text)],
@@ -73,10 +94,10 @@ class WARFMCPServer:
         )
 
     def _tool_schemas(self) -> list[Tool]:
-        return [
+        tools = [
             Tool(
                 name="remember",
-                description="Deposit content to shared ReasonRDN memory. Tags help with discovery and filtering. Pass tokens_used for accurate harness metrics.",
+                description="Remember content in local ReasonRDN memory. This never publishes or admits content.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -91,7 +112,7 @@ class WARFMCPServer:
             ),
             Tool(
                 name="recall",
-                description="Search shared memory by free-text query. Returns matching handoff artifacts ordered by recency.",
+                description="Search local ReasonRDN memory by free-text query.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -105,51 +126,72 @@ class WARFMCPServer:
             ),
             Tool(
                 name="resolve",
-                description="Fetch a single artifact by its exact reason:// address.",
+                description="Resolve one reason:// artifact from exactly local memory or the Reason Registry. Local is the default and there is no automatic fallback.",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "address": {"type": "string", "description": "The reason:// address"},
+                        "source": {
+                            "type": "string",
+                            "enum": ["local", "registry"],
+                            "default": "local",
+                        },
+                        "version": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                        },
+                        "bypass_cache": {"type": "boolean", "default": False},
                     },
                     "required": ["address"],
                 },
             ),
             Tool(
-                name="xchange_resolve",
-                description="Resolve a full reason:// URI against the warf Xchange broker.",
+                name="arbitrate",
+                description="Explicitly submit competing evidence-bearing packages to the WARF Gateway. This is a network action.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "uri": {"type": "string", "description": "reason://domain/category/task"},
-                        "bypass_cache": {"type": "boolean"},
+                        "query_text": {"type": "string"},
+                        "packages": {
+                            "type": "array",
+                            "minItems": 2,
+                            "items": {"type": "object"},
+                        },
+                        "reason_address": {"type": "string"},
+                        "query_id": {"type": "string"},
                     },
-                    "required": ["uri"],
+                    "required": ["query_text", "packages"],
                 },
             ),
             Tool(
-                name="xchange_share",
-                description="Share a high-signal artifact to the central warf Xchange.",
+                name="admit",
+                description="Explicitly publish a selected, arbitration-backed artifact to the Reason Registry. This is a network write and defaults to create-only.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "content": {"type": "string", "description": "The insight, fix, or pattern"},
-                        "uri": {"type": "string", "description": "Canonical reason:// URI"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "project": {"type": "string", "default": "astrognosy"},
-                        "tokens_used": {"type": "integer", "description": "Optional token count for harness metrics"},
+                        "artifact": {"type": "object"},
+                        "arbitration": {"type": "object"},
+                        "expected_current_version": {
+                            "type": ["string", "null"],
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "default": None,
+                        },
                     },
-                    "required": ["content"],
+                    "required": ["artifact", "arbitration"],
                 },
             ),
             Tool(
-                name="harness_status",
-                description="Get harness metrics and stack status.",
+                name="status",
+                description="Show local harness state and configured network endpoints without performing a network action.",
                 inputSchema={
                     "type": "object",
                     "properties": {},
                 },
             ),
         ]
+        if tuple(tool.name for tool in tools) != MCP_ADVERTISED_TOOLS:
+            raise RuntimeError("MCP tool schemas drifted from rdn/protocol-lock.json")
+        return tools
 
     def _register_tools(self):
         @self.server.call_tool()
@@ -196,22 +238,27 @@ class WARFMCPServer:
 
                 if name == "resolve":
                     address = arguments.get("address", "")
-                    artifact = self.memory.resolve(address)
-                    if not artifact:
-                        return self._text_result({"status": "not_found", "address": address})
-                    return self._text_result({"status": "ok", "artifact": artifact})
-
-                if name == "xchange_resolve":
-                    uri = arguments.get("uri", "")
-                    result = self.memory.resolve_reason_uri(
-                        uri,
+                    artifact = self.memory.resolve(
+                        address,
+                        source=arguments.get("source", "local"),
+                        version=arguments.get("version"),
                         bypass_cache=bool(arguments.get("bypass_cache", False)),
                     )
-                    return self._text_result(
-                        {"status": "ok", "result": result or {"not_found": uri}}
-                    )
+                    if not artifact:
+                        return self._text_result({"status": "not_found", "address": address})
+                    return self._text_result(artifact)
 
-                if name == "harness_status":
+                if name in {"network_resolve", "xchange_resolve"}:
+                    uri = arguments.get("uri", "")
+                    result = self.memory.resolve(
+                        uri,
+                        source="registry",
+                        version=arguments.get("version"),
+                        bypass_cache=bool(arguments.get("bypass_cache", False)),
+                    )
+                    return self._text_result(result)
+
+                if name in {"status", "harness_status"}:
                     import rdn as reason
                     return self._text_result(
                         {
@@ -221,7 +268,30 @@ class WARFMCPServer:
                         }
                     )
 
-                if name == "xchange_share":
+                if name in {"arbitrate", "network_arbitrate", "xchange_arbitrate"}:
+                    kwargs = {
+                        key: arguments[key]
+                        for key in ("reason_address", "query_id")
+                        if arguments.get(key) is not None
+                    }
+                    result = self.memory.network_arbitrate(
+                        arguments.get("query_text", ""),
+                        arguments.get("packages", []),
+                        **kwargs,
+                    )
+                    return self._text_result(result)
+
+                if name == "admit":
+                    result = self.memory.admit(
+                        arguments.get("artifact", {}),
+                        arguments.get("arbitration", {}),
+                        expected_current_version=arguments.get(
+                            "expected_current_version"
+                        ),
+                    )
+                    return self._text_result(result)
+
+                if name in {"network_share", "xchange_share"}:
                     import rdn as reason
                     raw_tags = arguments.get("tags", [])
                     if isinstance(raw_tags, str):
@@ -235,11 +305,21 @@ class WARFMCPServer:
                         tags=tags,
                         project=arguments.get("project", "astrognosy"),
                         tokens_used=int(tokens_used) if tokens_used else None,
-                        xchange_share=True,
+                        network_share=True,
                     )
-                    return self._text_result({"status": "shared", "result": result})
+                    return self._text_result(_network_share_envelope(result))
 
                 return self._text_result(f"Unknown tool: {name}", is_error=True)
+            except RDNHTTPError as exc:
+                return self._text_result(
+                    {
+                        "status": "request_error",
+                        "status_code": exc.status_code,
+                        "detail": str(exc),
+                        "payload": exc.payload,
+                    },
+                    is_error=True,
+                )
             except Exception as exc:
                 return self._text_result(str(exc), is_error=True)
 
@@ -260,9 +340,9 @@ class WARFMCPServer:
         print(f"  Node available: {self.memory.available}", file=sys.stderr)
         print(f"  Node URL: {self.memory.node_url}", file=sys.stderr)
         print(f"  Local DB: {self.memory.db_path}", file=sys.stderr)
-        if self.memory.node_url and "warf.astrognosy.com" in self.memory.node_url:
+        if self.memory.broker_url:
             print(
-                "  *** Using warf Xchange - reasoning artifacts will be shared to the central exchange ***",
+                f"  WARF Gateway: {self.memory.broker_url} (selected network actions enabled)",
                 file=sys.stderr,
             )
 

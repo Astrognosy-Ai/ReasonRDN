@@ -8,12 +8,13 @@ import json
 import logging
 import os
 import sqlite3
-import threading
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+
+from ..addressing import project_address as _project_address
 
 LOGGER = logging.getLogger("rdn.node")
 DEFAULT_HOST = "127.0.0.1"
@@ -73,11 +74,6 @@ def ensure_schema(db_path: str) -> None:
 
 def _hash_payload(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
-
-
-def _project_address(project: str, content: str) -> str:
-    task_slug = hashlib.md5(content[:50].encode("utf-8")).hexdigest()[:8]
-    return f"reason://{project}/handoff/{task_slug}"
 
 
 class PrivateWARFNodeServer(ThreadingHTTPServer):

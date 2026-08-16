@@ -1,5 +1,5 @@
 """
-rdn.dash - web dashboard for the ReasonRDN / WARF / Xchange stack.
+rdn.dash - web dashboard for ReasonRDN memory and optional WARF networking.
 
 Launch with:
   rdn-dash
@@ -19,24 +19,16 @@ This file is structured to avoid the "Runtime instance already exists!" error.
 
 from __future__ import annotations
 
-import os
-import json
 import hashlib
-from datetime import datetime
-from typing import Any, Dict, List, Optional
 
 try:
     import streamlit as st
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 except ImportError:
     print("Install with: pip install 'reason-rdn[dash]' or 'reason-rdn[full]'")
     raise
 
 import rdn as reason  # THE coherent API
-from rdn.client import XCHANGE_BROKER_URL, XPORT_URL  # for display only
-from rdn.handoff import sync as rdn_sync
-
+from rdn.client import RDNClient
 
 # ============================================================
 #  UI HELPERS (safe to call from _app only)
@@ -72,7 +64,7 @@ def _app():
 
     # --- Page config ---
     st.set_page_config(
-        page_title="Reason • WARF Xchange",
+        page_title="ReasonRDN • WARF",
         page_icon="🧠",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -99,10 +91,10 @@ def _app():
     st.markdown("""
     **One command. Persistent agent memory.**
 
-    Persistent memory across every agent and session.  
-    Auto-share to the WARF Xchange broker at warf.astrognosy.com.  
-    Local memory and artifact hashes stay simple and auditable.  
-    Xport at reason.astrognosy.com + xport.astrognosy.com for public canonical resolution.
+    Persistent memory across every agent and session.
+    Explicitly share selected handoffs through the WARF Gateway at warf.astrognosy.com.
+    Local memory and artifact hashes stay simple and auditable.
+    Reason Registry at reason.astrognosy.com, with xport.astrognosy.com retained for compatibility.
 
     Live metrics: token savings, velocity, ship rate, positive signals, and suggestions.
 
@@ -111,27 +103,26 @@ def _app():
 
     st.success("ReasonRDN is running. Your agents can now keep local memory across sessions, optionally share high-signal artifacts through the broker, and track estimated token savings from reused reason:// artifacts.")
 
+    status = reason.status()
+
     # --- Sidebar toggle ---
-    # Xchange sharing is now the default (you can still opt out for purely local use)
-    use_xchange = st.sidebar.checkbox(
-        "XCHANGE MODE - use public broker  [default: ON]",
-        value=True,
-        help="When enabled, deposits go through the public broker for network workflows."
+    use_network = st.sidebar.checkbox(
+        "WARF NETWORK - share selected handoffs",
+        value=bool(status.get("network_mode")),
+        help="When enabled, explicitly selected deposits use the WARF Gateway. Local retention remains the default."
     )
 
     # --- Status ---
     st.subheader("Harness Status & Impact")
-    status = reason.status()
-
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Local Node", "🟢 Online" if status.get("local_available") else "🔴 Offline", "private + Xchange mirror")
+        st.metric("Local Node", "🟢 Online" if status.get("local_available") else "🔴 Offline", "private by default")
     with col2:
-        st.metric("Xchange Broker", "🟢 warf.astrognosy.com", "Public broker")
+        st.metric("WARF Gateway", "🟢 warf.astrognosy.com", "Optional network arbitration")
     with col3:
-        st.metric("Xport Registry", "🟢 reason.astrognosy.com + xport.astrognosy.com", "Public canonicals")
+        st.metric("Reason Registry", "🟢 reason.astrognosy.com", "xport hostname compatible")
     with col4:
-        st.metric("Mode", "BROKER" if use_xchange else "LOCAL", "Local memory first")
+        st.metric("Mode", "NETWORK" if use_network else "LOCAL", "Local memory first")
 
     # --- Metrics ---
     st.subheader("Your Impact (Agnostic Harness Metrics)")
@@ -171,20 +162,28 @@ def _app():
             with col_prefix:
                 st.markdown("**reason://**")
             with col_rest:
-                uri_rest = st.text_input("URI suffix for Xport promotion (optional)", 
+                uri_rest = st.text_input("reason:// address suffix (optional)",
                                          value="", label_visibility="collapsed",
                                          placeholder="grok/build/test   or   warf/decision-theory/...")
             uri = f"reason://{uri_rest}" if uri_rest else None
             tokens_used = st.number_input("Tokens used to produce this (optional, for accurate harness metrics)", min_value=0, value=0, step=100, help="Report the real token cost of the work that produced this artifact. Used for precise savings tracking when others resolve it later.")
         with col_b:
-            target_xchange = st.checkbox("Send to Xchange broker", value=use_xchange)
-            st.caption("Local mirror always happens.")
+            target_network = st.checkbox("Prepare for WARF arbitration", value=use_network)
+            st.caption("This deposit stays local and returns the explicit arbitrate → admit next steps.")
 
             if st.button("🚀 DEPOSIT TO HARNESS", use_container_width=True, type="primary"):
                 tags_list = [t.strip() for t in tags.split(",") if t.strip()]
                 meta = {"reason_uri": uri} if uri else {}
                 tu = int(tokens_used) if tokens_used and tokens_used > 0 else None
-                res = reason.remember(content, uri=uri, tags=tags_list, project=project, meta=meta, tokens_used=tu)
+                res = reason.remember(
+                    content,
+                    uri=uri,
+                    tags=tags_list,
+                    project=project,
+                    meta=meta,
+                    tokens_used=tu,
+                    network_share=target_network,
+                )
                 st.success(f"Deposited. Your harness metrics just updated. artifact_hash: {res.get('artifact_hash', 'N/A')[:16]}...")
 
                 if res.get("artifact_hash"):
@@ -192,11 +191,11 @@ def _app():
                     render_fingerprint_viz(res["artifact_hash"])
 
     # ============================================================
-    #  REASON:// EXPLORER (Xport resolution)
+    #  REASON:// EXPLORER
     # ============================================================
 
     with st.container(border=True):
-        st.markdown("### reason:// Explorer (Xport)")
+        st.markdown("### reason:// Explorer")
 
         # Session state for prefix input persistence
         if "explorer_prefix" not in st.session_state:
@@ -227,7 +226,7 @@ def _app():
         if st.button("🔍 RESOLVE / BROWSE PREFIX", use_container_width=True):
             if uri:
                 # Try exact first
-                art = reason.resolve(uri)
+                art = RDNClient().resolve_from_registry(uri) if use_network else reason.resolve(uri)
                 if art:
                     st.json(art)
                     if art.get("artifact_hash"):
@@ -318,11 +317,7 @@ def _app():
 
     with tab1:
         # Simple recall (coherent API)
-        from rdn.client import RDNClient
         c = RDNClient()
-        if use_xchange:
-            c.broker_url = XCHANGE_BROKER_URL
-            c.xport_url = XPORT_URL
         recent = c.recall("handoff", limit=8)
         if recent:
             for item in recent:
@@ -349,7 +344,7 @@ def _app():
 
     # Footer coherence note
     st.caption(
-        "Local harness (this) + warf.astrognosy.com (broker) + reason.astrognosy.com / xport.astrognosy.com (registry). "
+        "Local harness (this) + warf.astrognosy.com (WARF Gateway) + reason.astrognosy.com (Reason Registry). "
         "This public package does not expose private scoring internals."
     )
 
@@ -372,6 +367,7 @@ def launch():
     and executes the real app code inside _app().
     """
     import sys
+
     from streamlit.web import cli as stcli
 
     if len(sys.argv) > 1 and sys.argv[1] in ("--help", "-h"):

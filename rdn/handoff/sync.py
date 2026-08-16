@@ -20,6 +20,7 @@ import os
 import subprocess
 import time
 from datetime import datetime, timezone
+from threading import Event
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from rdn.handoff.protocol import ReasonRDN
@@ -27,7 +28,7 @@ from rdn.handoff.protocol import ReasonRDN
 DEFAULT_ROOT = os.environ.get("RDN_REPO_ROOT", r"C:\Users\Scooter\Coworker\Projects\GitHub")
 DEFAULT_INTERVAL = int(os.environ.get("RDN_SCAN_INTERVAL", "300"))
 DEFAULT_NODE_URL = os.environ.get("RDN_NODE_URL") or os.environ.get("WARF_NODE_URL") or os.environ.get("REASON_NODE_URL")
-# For warf Xchange: set REASON_USE_XCHANGE=1 (or pass --xchange to CLI / node_url to installer)
+# For optional WARF networking, prefer REASON_USE_NETWORK=1. Legacy Xchange names remain compatible.
 DEFAULT_TAGS = ["handoff", "ReasonRDN", "repo-state", "auto"]
 
 SKIP_DIRS = {
@@ -310,9 +311,8 @@ def run_loop(
     interval: int,
     node_url: Optional[str],
     install_repo_hooks: bool,
-    stop_event: Optional["threading.Event"] = None,
+    stop_event: Optional[Event] = None,
 ) -> None:
-    import threading as _threading  # local to avoid top-level dep if not used
     while True:
         run_once(None, root, node_url, install_repo_hooks)
         if stop_event is not None:

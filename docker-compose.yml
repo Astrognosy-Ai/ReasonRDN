@@ -13,7 +13,9 @@ services:
       # Persistent config file
       - reasonrdn_config:/root/.reason-ecosystem.cfg
     environment:
-      - REASON_USE_XCHANGE=1  # Enable Xchange by default inside container
+      # Local-first by default. Set REASON_USE_NETWORK=1 explicitly when the
+      # container should use the WARF Gateway and Reason Registry.
+      REASON_USE_NETWORK: "${REASON_USE_NETWORK:-0}"
     restart: unless-stopped
 
 volumes:
