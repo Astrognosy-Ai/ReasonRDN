@@ -1,7 +1,11 @@
 {
   "$id": "astrognosy.reason-artifact/v1",
-  "packageVersion": "0.5.0",
+  "packageVersion": "0.6.0",
   "eventRecordSchema": "https://warf.astrognosy.com/schemas/event-record/v2",
+  "registryValidationMethods": [
+    "https://warf.astrognosy.com/schemas/event-record/v2",
+    "https://reason.astrognosy.com/schemas/convergence-event/v1"
+  ],
   "uri": {
     "scheme": "reason",
     "segments": 3,
@@ -36,17 +40,81 @@
     "admittedAtInVersion": false
   },
   "sdk": {
-    "resolutionSources": ["local", "registry"],
+    "resolutionSources": ["local", "registry", "chain"],
     "defaultResolutionSource": "local",
-    "automaticNetworkFallback": false
+    "automaticNetworkFallback": false,
+    "resolverScopes": ["local", "organization", "shared"],
+    "defaultResolverScope": "local",
+    "resolverChainOrder": ["local", "organization", "shared"]
+  },
+  "contribution": {
+    "schema": "https://reason.astrognosy.com/schemas/contribution/v1",
+    "fields": [
+      "schema",
+      "contribution_id",
+      "reason_address",
+      "scope",
+      "artifact",
+      "context",
+      "adapter",
+      "created_at"
+    ],
+    "artifactFields": [
+      "media_type",
+      "content_encoding",
+      "content_base64",
+      "content_digest"
+    ],
+    "scopes": ["local", "organization", "shared"],
+    "networkScopes": ["organization", "shared"],
+    "contentEncoding": "base64",
+    "contentDigestAlgorithm": "SHA-256",
+    "idPrefix": "sha256:",
+    "idMaterialFields": [
+      "schema",
+      "reason_address",
+      "scope",
+      "artifact",
+      "context",
+      "adapter"
+    ],
+    "createdAtInId": false,
+    "mediaTypeMaxLength": 255,
+    "contentMaxBytes": 700000,
+    "contextMaxBytes": 16384,
+    "adapterMaxBytes": 8192,
+    "adapterDefault": {},
+    "networkRoute": "/contributions",
+    "idempotencyHeader": "Idempotency-Key",
+    "receiptFields": [
+      "contribution_id",
+      "reason_address",
+      "scope",
+      "status",
+      "replayed",
+      "epoch_digest",
+      "convergence_event_digest",
+      "decision",
+      "current_version"
+    ],
+    "receiptStatuses": ["converged", "held"],
+    "receiptDecisions": [
+      "bootstrap-provisional",
+      "provisional-rebase",
+      "advance",
+      "hold",
+      "incumbent-retained",
+      "abstained",
+      "adapter-required"
+    ]
   },
   "mcp": {
     "advertisedTools": [
       "remember",
       "recall",
       "resolve",
+      "contribute",
       "arbitrate",
-      "admit",
       "status"
     ]
   }

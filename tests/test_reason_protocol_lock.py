@@ -1,4 +1,4 @@
-"""Focused 0.5.0 contract tests for the one-source ReasonRDN SDK and MCP."""
+"""Focused 0.6.0 contract tests for the ReasonRDN SDK and MCP lock."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from rdn.artifact import (
     PROTOCOL_LOCK,
     PROTOCOL_LOCK_DIGEST,
     PROTOCOL_LOCK_ID,
+    REGISTRY_VALIDATION_METHODS,
     ArtifactValidationError,
     ReasonArtifact,
     artifact_version,
@@ -75,10 +76,34 @@ def _client(tmp_path, monkeypatch):
 
 def test_protocol_lock_is_the_imported_single_source():
     assert PROTOCOL_LOCK_ID == "astrognosy.reason-artifact/v1"
-    assert PROTOCOL_LOCK["packageVersion"] == "0.5.0"
+    assert PROTOCOL_LOCK["packageVersion"] == "0.6.0"
     assert PROTOCOL_LOCK["eventRecordSchema"] == EVENT_RECORD_SCHEMA
     assert tuple(PROTOCOL_LOCK["artifact"]["fields"]) == CANONICAL_ARTIFACT_FIELDS
     assert tuple(PROTOCOL_LOCK["mcp"]["advertisedTools"]) == MCP_ADVERTISED_TOOLS
+    contribution = PROTOCOL_LOCK["contribution"]
+    assert contribution["scopes"] == ["local", "organization", "shared"]
+    assert contribution["networkScopes"] == ["organization", "shared"]
+    assert contribution["receiptFields"] == [
+        "contribution_id",
+        "reason_address",
+        "scope",
+        "status",
+        "replayed",
+        "epoch_digest",
+        "convergence_event_digest",
+        "decision",
+        "current_version",
+    ]
+    assert contribution["receiptStatuses"] == ["converged", "held"]
+    assert contribution["receiptDecisions"] == [
+        "bootstrap-provisional",
+        "provisional-rebase",
+        "advance",
+        "hold",
+        "incumbent-retained",
+        "abstained",
+        "adapter-required",
+    ]
     assert "profile" not in rfc8785.dumps(PROTOCOL_LOCK).decode("utf-8").lower()
     assert len(PROTOCOL_LOCK_DIGEST) == 64
     assert PROTOCOL_LOCK_DIGEST == hashlib.sha256(rfc8785.dumps(PROTOCOL_LOCK)).hexdigest()
@@ -181,6 +206,33 @@ def test_registry_parser_rejects_empty_or_unsorted_validation():
     payload["validation"] = unsorted
     with pytest.raises(ArtifactValidationError, match="canonical JCS byte order"):
         parse_reason_artifact(payload, source="registry")
+
+
+def test_registry_accepts_warf_or_convergence_validation_and_rejects_unknown():
+    convergence_method = "https://reason.astrognosy.com/schemas/convergence-event/v1"
+    assert REGISTRY_VALIDATION_METHODS == (EVENT_RECORD_SCHEMA, convergence_method)
+
+    warf = parse_reason_artifact(_registry_artifact(), source="registry")
+    convergence = parse_reason_artifact(
+        _registry_artifact(
+            validation=[
+                {
+                    "method": convergence_method,
+                    "event_id": "convergence-1",
+                    "profile": "bootstrap-v1",
+                }
+            ]
+        ),
+        source="registry",
+    )
+    assert warf.validation[0]["method"] == EVENT_RECORD_SCHEMA
+    assert convergence.validation[0]["method"] == convergence_method
+
+    unknown = _registry_artifact(
+        validation=[{"method": "https://example.invalid/unknown", "event_id": "x"}]
+    )
+    with pytest.raises(ArtifactValidationError, match="must be one of"):
+        parse_reason_artifact(unknown, source="registry")
 
 
 def test_local_and_registry_resolve_return_one_verified_type(tmp_path, monkeypatch):
@@ -299,6 +351,8 @@ def test_mcp_advertises_exactly_the_six_locked_tools():
     server = mcp_server.WARFMCPServer.__new__(mcp_server.WARFMCPServer)
     names = tuple(tool.name for tool in server._tool_schemas())
     assert names == MCP_ADVERTISED_TOOLS
+    assert names == ("remember", "recall", "resolve", "contribute", "arbitrate", "status")
+    assert "admit" not in names
     assert not {
         "network_resolve",
         "network_share",
