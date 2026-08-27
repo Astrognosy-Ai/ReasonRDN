@@ -1,6 +1,6 @@
 {
   "name": "ReasonRDN",
-  "install": "pip install -e '.[full]' pytest ruff black",
+  "install": "pip install -e '.[mcp,dash]' pytest ruff black",
   "terminals": [
     {
       "name": "rdn-node",
