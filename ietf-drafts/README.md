@@ -12,13 +12,22 @@ until a separate review and submission action.
 
 The intended next-revision boundary is simple:
 
-- reason:// specifies addressing and resolver-relative lookup.
-- WARF specifies arbitration and event-record verification.
-- The reason:// scheme itself does not require WARF. Astrognosy's managed
-  Registry `/admissions` profile requires an exact retained, selected WARF v2
-  event.
-- Protected scoring, WARF Edge, and Xfer vertical technology are not public
-  protocol requirements.
+- reason:// specifies stable task addressing, local/organization/shared
+  resolver layers, current and pinned artifacts, durable contribution, and
+  deterministic URI-scoped convergence.
+- WARF specifies independently usable arbitration, exact scoring-profile
+  binding, deterministic tie-breaking, and event-record verification.
+- A Reason resolver may compose a retained WARF event with a separately
+  attested advancement profile, then own the convergence event and current
+  pointer transition. WARF does not require or mutate a Reason Registry.
+- Protected profile formulas remain behind versioned attestations. WARF Edge's
+  Edge/Flow/Xact matching domain and Xfer's P2P/PSV exchange domain remain
+  separately owned systems.
+
+ReasonRDN's public protocol lock implements the next Reason boundary through
+one artifact type, the local/organization/shared resolver chain, an idempotent
+contribution envelope and receipt, and the six agent actions `remember`,
+`recall`, `resolve`, `contribute`, `arbitrate`, and `status`.
 
 These documents are work in progress, not approved RFCs. The next RFCXML and
 renders remain private, local, and unsubmitted until a separate review and

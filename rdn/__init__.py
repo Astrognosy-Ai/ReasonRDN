@@ -18,7 +18,7 @@ This package is the open public on-ramp to the reason:// ecosystem.
 
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .artifact import (
     CANONICAL_ARTIFACT_FIELDS,
@@ -27,6 +27,7 @@ from .artifact import (
     PROTOCOL_LOCK,
     PROTOCOL_LOCK_DIGEST,
     PROTOCOL_LOCK_ID,
+    REGISTRY_VALIDATION_METHODS,
     ArtifactValidationError,
     ReasonArtifact,
     artifact_version,
@@ -44,6 +45,24 @@ from .client import (
     RDNRequestError,
     RDNTransportError,
     RDNUnavailableError,
+)
+from .contribution import (
+    CONTRIBUTION_SCHEMA,
+    CONTRIBUTION_SCOPES,
+    CONTRIBUTION_RECEIPT_FIELDS,
+    CONTRIBUTION_RECEIPT_DECISIONS,
+    CONTRIBUTION_RECEIPT_STATUSES,
+    ContributionEnvelope,
+    contribution_id,
+    parse_contribution_envelope,
+    parse_contribution_receipt,
+)
+from .doclang_adapter import (
+    DOCLANG_MEDIA_TYPE,
+    DocLangAdapterError,
+    DocLangDependencyError,
+    PreparedDocLangContribution,
+    prepare_doclang_contribution,
 )
 from .client import (
     REASON_XPORT_URL as REASON_XPORT_URL,
@@ -75,6 +94,7 @@ from .reason import (
     WARFClient,
     add_recent_uri,
     admit,
+    contribute,
     get_recent_uris,
     harness_metrics,
     list_prefix,
@@ -102,7 +122,22 @@ __all__ = [
     "PROTOCOL_LOCK_DIGEST",
     "CANONICAL_ARTIFACT_FIELDS",
     "EVENT_RECORD_SCHEMA",
+    "REGISTRY_VALIDATION_METHODS",
     "MCP_ADVERTISED_TOOLS",
+    "CONTRIBUTION_SCHEMA",
+    "CONTRIBUTION_SCOPES",
+    "CONTRIBUTION_RECEIPT_FIELDS",
+    "CONTRIBUTION_RECEIPT_DECISIONS",
+    "CONTRIBUTION_RECEIPT_STATUSES",
+    "ContributionEnvelope",
+    "contribution_id",
+    "parse_contribution_envelope",
+    "parse_contribution_receipt",
+    "DOCLANG_MEDIA_TYPE",
+    "DocLangAdapterError",
+    "DocLangDependencyError",
+    "PreparedDocLangContribution",
+    "prepare_doclang_contribution",
     "Reason",
     "remember",
     "resolve",
@@ -110,6 +145,7 @@ __all__ = [
     "add_recent_uri",
     "get_recent_uris",
     "network_arbitrate",
+    "contribute",
     "admit",
     "status",
     "harness_metrics",

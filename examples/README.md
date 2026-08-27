@@ -1,116 +1,102 @@
-# ReasonRDN Examples
+# ReasonRDN examples
 
-This directory shows how to retain work locally, arbitrate competing candidates,
-admit one selected result, and resolve it by immutable `reason://` version.
+Resolve before repeating expensive work, then contribute the reusable result.
+WARF arbitration remains a separate action for competing candidates.
 
-## Architecture Note
-
-- Local memory works without network access.
-- The WARF Gateway at `https://warf.astrognosy.com` arbitrates at least two
-  candidates and retains the exact event record.
-- The Reason Registry at `https://reason.astrognosy.com` resolves `reason://`
-  addresses and accepts a separate authenticated admission request.
-- Arbitration never writes the Registry. Remember and default resolve never use
-  the network.
-
-## Agent Prompts
+## Agent prompts
 
 ```text
-Install ReasonRDN and use the rdn CLI or MCP tools to remember durable project context.
+Before solving this, resolve reason://<domain>/<category>/<task> through the configured scope.
 ```
 
 ```text
-Before solving this, resolve reason://<domain>/<category>/<task> to see whether useful prior context exists.
+Contribute this reusable solution under reason://ops/deployment/ecs-task-failures.
 ```
 
-```text
-Remember this solution under reason://ops/deployment/ecs-task-failures with tags ops,ecs,networking.
-```
-
-## Local Deposit
+## Resolve and contribute
 
 ```python
-from rdn.handoff import ReasonRDN
-
-rdn = ReasonRDN()
-rdn.deposit_handoff(
-    project="my-team",
-    summary="ECS tasks need assignPublicIp: ENABLED for ECR pulls in private subnets",
-    state_tokens=["ecs", "ecr", "private-subnet", "assignPublicIp"],
-    tags=["infra", "ecs", "networking"],
-)
-```
-
-## Arbitrate, admit, resolve
-
-```python
-from rdn import RDNClient, ReasonArtifact
+from rdn import RDNClient
 
 client = RDNClient()
 address = "reason://ops/ecr/private-pull-failures"
-answers = {
-    "candidate-a": "Enable the reviewed network setting, then verify an ECR pull.",
-    "candidate-b": "Restart every task without changing network configuration.",
-}
 
+artifact = client.resolve(address, source="chain", scope="organization")
+if artifact is None:
+    result = client.contribute(
+        "Enable the reviewed network setting, then verify an ECR pull.",
+        reason_address=address,
+        scope="organization",
+        tags=["infra", "ecs", "networking"],
+    )
+```
+
+The SDK writes the contribution to SQLite before its bounded background
+delivery attempt. Local scope retains the contribution and never POSTs.
+
+## Exact documents
+
+```python
+from pathlib import Path
+from rdn import RDNClient
+
+RDNClient().contribute(
+    Path("runbook.xml").read_bytes(),
+    reason_address="reason://ops/runbook/rollback",
+    scope="organization",
+    media_type="application/xml",
+)
+```
+
+The exact XML bytes are base64-encoded for transport and bound to their SHA-256
+digest. ReasonRDN does not reserialize the document.
+
+Run the same resolve-before-convert loop with a local DocLang or
+Docling-supported file:
+
+```powershell
+$python = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
+& $python .\examples\resolve_doclang_contribute.py .\runbook.dclg `
+  --uri reason://ops/runbook/rollback `
+  --scope local
+```
+
+Local is the default scope. The example performs no fetch or publication.
+
+## Independent WARF arbitration
+
+```python
 decision = client.network_arbitrate(
     "Choose the supported ECR recovery.",
     [
-        {
-            "agent_id": candidate_id,
-            "answer_text": answer,
-            "corpus": [{"doc_id": "runbook", "text": "Verify the network setting before restart."}],
-        }
-        for candidate_id, answer in answers.items()
+        {"agent_id": "candidate-a", "answer_text": "Verify, then switch."},
+        {"agent_id": "candidate-b", "answer_text": "Switch immediately."},
     ],
     reason_address=address,
 )
-
-if decision["status"] == "selected":
-    selected = ReasonArtifact.from_dict(
-        {
-            "address": address,
-            "media_type": "text/plain; charset=utf-8",
-            "content": answers[decision["winner_submission_id"]],
-        },
-        source="local",
-    )
-    admitted = client.admit(
-        selected,
-        {
-            "query_id": decision["query_id"],
-            "winner_submission_id": decision["winner_submission_id"],
-            "event_record": decision["event_record"],
-            "audit_hash": decision["audit_hash"],
-        },
-        expected_current_version=None,
-    )
-    resolved = client.resolve(
-        address,
-        source="registry",
-        version=admitted.version,
-    )
-    assert resolved.to_dict() == admitted.to_dict()
 ```
+
+Arbitration returns retained event custody. Managed convergence may use WARF
+when comparing eligible candidates, but an ordinary agent contributes without
+manually performing low-level admission. The 0.5 `admit` SDK and CLI call
+remains available for compatibility.
 
 ## CLI
 
-```bash
+```powershell
 rdn remember "Useful deployment note" --project ops --tags deploy,ecs
 rdn recall "deployment note" --project ops
-rdn --network arbitrate "Choose the supported recovery" \
-  --uri reason://ops/ecr/private-pull-failures \
-  --package candidate-a:"Enable the reviewed setting, then verify" \
-  --package candidate-b:"Restart without changing the setting"
-rdn admit @artifact.json @arbitration.json
-rdn resolve reason://ops/ecr/private-pull-failures \
-  --source registry --version sha256:<64-lowercase-hex>
-rdn-sync --once --install-hooks
+rdn resolve reason://ops/ecr/private-pull-failures --source chain --scope organization
+rdn contribute "Enable the reviewed setting, then verify" `
+  --uri reason://ops/ecr/private-pull-failures `
+  --scope organization
+rdn queue
+rdn queue --flush
 ```
 
-## Security Notes
+## Security notes
 
-- The local node is localhost-only by default.
-- Use the configured Gateway credential for arbitration and
-  `REASON_REGISTRY_API_KEY` for admission.
-- This public package contains client and local-memory code only.
+- Local memory and local contributions remain on the local machine by default.
+- Organization and shared contribution writes require selecting that scope.
+- Resolver credentials come from environment or local configuration.
+- This public package does not contain protected scoring or convergence policy.

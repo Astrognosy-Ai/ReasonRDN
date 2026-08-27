@@ -6,7 +6,8 @@ This is the "one thing" you (and agents) should use.
 It unifies:
 - Local ReasonRDN handoffs (repo state, decisions, insights)
 - Explicit arbitration through the WARF Gateway (warf.astrognosy.com)
-- Explicit selected-result admission to the Reason Registry
+- Durable scoped contribution to a Reason resolver
+- Low-level selected-result admission compatibility
 - Resolution from the Reason Registry (reason.astrognosy.com)
 
 The public package talks to the Gateway and Registry boundaries. Protected
@@ -108,9 +109,9 @@ class HarnessMetrics:
     def get_suggestions(self) -> List[str]:
         suggestions = []
         if self.data["total_recalls"] > 5 and self.data["estimated_tokens_saved"] > 10000:
-            suggestions.append("High recall rate - you are benefiting from prior artifacts. Give selected work a precise reason:// address so it can be arbitrated and admitted when useful.")
+            suggestions.append("High recall rate - you are benefiting from prior artifacts. Give reusable work a precise reason:// address and contribute it within the configured scope.")
         if self.data["vibe_stars"] > 3:
-            suggestions.append("Strong positive signal. Consider explicit WARF arbitration and Registry admission for the best handoff.")
+            suggestions.append("Strong positive signal. Contribute the reusable result, or call WARF separately when competing candidates need arbitration.")
         if self.get_ship_rate() < 20:
             suggestions.append("Ship rate low - add clearer project, tags, and state_tokens in handoffs to improve local recall precision.")
         self.data["workflow_suggestions"] = suggestions[:3]
@@ -133,11 +134,12 @@ _harness_metrics = HarnessMetrics()
 # The single coherent high-level namespace (what agents and humans should reach for)
 class Reason:
     """
-    One coherent object for local memory plus the optional WARF network.
+    One coherent object for layered Reason memory plus optional WARF arbitration.
 
     Automatically handles the split:
-    - WARF Gateway (warf.astrognosy.com) for arbitration
-    - Reason Registry (reason.astrognosy.com) for admission and resolution
+    - local, organization, and shared contribution and resolver scopes
+    - WARF Gateway (warf.astrognosy.com) for independent arbitration
+    - Reason Registry (reason.astrognosy.com) for managed resolution
     """
 
     def __init__(self, xchange: bool = False, network: Optional[bool] = None):
@@ -189,6 +191,7 @@ class Reason:
         uri_or_address: str,
         *,
         source: str = "local",
+        scope: Optional[str] = None,
         version: Optional[str] = None,
         bypass_cache: bool = False,
     ) -> Optional[ReasonArtifact]:
@@ -196,8 +199,17 @@ class Reason:
         return self._client.resolve(
             uri_or_address,
             source=source,
+            scope=scope,
             version=version,
             bypass_cache=bypass_cache,
+        )
+
+    def contribute(self, content, *, reason_address: str, **kwargs):
+        """Queue a reusable artifact in the configured Reason scope."""
+        return self._client.contribute(
+            content,
+            reason_address=reason_address,
+            **kwargs,
         )
 
     def network_arbitrate(self, query_text: str, packages: List[Dict[str, Any]], **kwargs):
@@ -222,7 +234,7 @@ class Reason:
 
     @property
     def status(self):
-        return {
+        current = {
             "network_mode": self._xchange_mode,
             "gateway": getattr(self._client, "broker_url", None),
             "registry": getattr(self._client, "xport_url", None),
@@ -235,6 +247,10 @@ class Reason:
             "xport": getattr(self._client, "xport_url", None),
             "local_available": self._client.available,
         }
+        runtime_status = getattr(self._client, "runtime_status", None)
+        if callable(runtime_status):
+            current.update(runtime_status())
+        return current
 
 
 # Back-compat + advanced SDK bridge (thin, safe)
@@ -249,12 +265,14 @@ class ReasonClient(Reason):
         uri_or_address: str,
         *,
         source: str = "registry",
+        scope: Optional[str] = None,
         version: Optional[str] = None,
         bypass_cache: bool = False,
     ) -> Optional[ReasonArtifact]:
         return self._client.resolve(
             uri_or_address,
             source=source,
+            scope=scope,
             version=version,
             bypass_cache=bypass_cache,
         )
@@ -305,6 +323,7 @@ def resolve(
     tokens_saved: int = None,
     *,
     source: str = "local",
+    scope: Optional[str] = None,
     version: Optional[str] = None,
     bypass_cache: bool = False,
 ):
@@ -312,11 +331,21 @@ def resolve(
     res = _get_default().resolve(
         uri_or_address,
         source=source,
+        scope=scope,
         version=version,
         bypass_cache=bypass_cache,
     )
     _harness_metrics.record_recall(str(uri_or_address), tokens_saved=tokens_saved)
     return res
+
+
+def contribute(content, *, reason_address: str, **kwargs):
+    """Durably queue a reusable artifact for local, organization, or shared scope."""
+    return _get_default().contribute(
+        content,
+        reason_address=reason_address,
+        **kwargs,
+    )
 
 def network_arbitrate(query_text: str, packages: List[Dict[str, Any]], **kwargs):
     res = _get_default().network_arbitrate(query_text, packages, **kwargs)

@@ -32,6 +32,9 @@ def _load_protocol_lock() -> Dict[str, Any]:
 PROTOCOL_LOCK = _load_protocol_lock()
 PROTOCOL_LOCK_ID = str(PROTOCOL_LOCK["$id"])
 EVENT_RECORD_SCHEMA = str(PROTOCOL_LOCK["eventRecordSchema"])
+REGISTRY_VALIDATION_METHODS: Tuple[str, ...] = tuple(
+    str(value) for value in PROTOCOL_LOCK["registryValidationMethods"]
+)
 CANONICAL_ARTIFACT_FIELDS: Tuple[str, ...] = tuple(
     str(value) for value in PROTOCOL_LOCK["artifact"]["fields"]
 )
@@ -232,11 +235,12 @@ class ReasonArtifact(Mapping[str, Any]):
                 )
             if any(
                 not isinstance(record, dict)
-                or record.get("method") != EVENT_RECORD_SCHEMA
+                or record.get("method") not in REGISTRY_VALIDATION_METHODS
                 for record in registry_validation
             ):
                 raise ArtifactValidationError(
-                    f"registry validation method must be {EVENT_RECORD_SCHEMA!r}"
+                    "registry validation method must be one of "
+                    + ", ".join(repr(value) for value in REGISTRY_VALIDATION_METHODS)
                 )
 
         meta_value = data.get("meta")

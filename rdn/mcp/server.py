@@ -5,9 +5,9 @@ MCP server exposing the unified ReasonRDN memory API as tools for Claude/Grok/Co
 
 Tools:
   - remember / recall: Retain and search local memory
-  - resolve: Fetch one verified artifact from an explicit source
+  - resolve: Fetch one verified artifact from an explicit source or scoped chain
+  - contribute: Queue reusable work in local, organization, or shared scope
   - arbitrate: Submit competing packages to the WARF Gateway
-  - admit: Publish one selected, event-backed artifact to the Reason Registry
   - status: Inspect local state and configured endpoints without network action
 
 Usage (after `pip install -e .`):
@@ -20,13 +20,15 @@ Environment / config (for explicit WARF network use or a custom node):
   RDN_NODE_URL=...
   The unified client loads from env + ~/.reason-ecosystem.cfg + local port file.
 
-Network mutation is available only through explicit arbitrate and admit calls.
-Local ReasonRDN memory remains the default.
+Network mutation is available only through selected contribution scopes or
+explicit arbitration. Local ReasonRDN memory remains the default. The legacy
+``admit`` handler stays callable for 0.5 compatibility but is not advertised.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 
@@ -126,15 +128,20 @@ class WARFMCPServer:
             ),
             Tool(
                 name="resolve",
-                description="Resolve one reason:// artifact from exactly local memory or the Reason Registry. Local is the default and there is no automatic fallback.",
+                description="Resolve one reason:// artifact from local memory, the shared Registry, or an explicit local-to-organization-to-shared chain. Local is the default.",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "address": {"type": "string", "description": "The reason:// address"},
                         "source": {
                             "type": "string",
-                            "enum": ["local", "registry"],
+                            "enum": ["local", "registry", "chain"],
                             "default": "local",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["local", "organization", "shared"],
+                            "description": "Maximum layer for source=chain; configured scope is used when omitted.",
                         },
                         "version": {
                             "type": "string",
@@ -143,6 +150,46 @@ class WARFMCPServer:
                         "bypass_cache": {"type": "boolean", "default": False},
                     },
                     "required": ["address"],
+                },
+            ),
+            Tool(
+                name="contribute",
+                description="Durably retain reusable artifact bytes and queue delivery within the selected scope. Local never performs an HTTP write.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Exact text encoded once as UTF-8.",
+                        },
+                        "content_base64": {
+                            "type": "string",
+                            "description": "Base64 for exact binary or pre-encoded document bytes.",
+                        },
+                        "reason_address": {
+                            "type": "string",
+                            "pattern": "^reason://[a-z][a-z0-9-]*/[a-z][a-z0-9-]*/[a-z][a-z0-9-]*$",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["local", "organization", "shared"],
+                        },
+                        "media_type": {
+                            "type": "string",
+                            "default": "text/plain; charset=utf-8",
+                        },
+                        "project": {"type": "string", "default": "astrognosy"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "metadata": {"type": "object"},
+                        "context": {"type": "object"},
+                        "adapter": {"type": "object"},
+                        "flush": {"type": "boolean", "default": False},
+                    },
+                    "required": ["reason_address"],
+                    "oneOf": [
+                        {"required": ["content"]},
+                        {"required": ["content_base64"]},
+                    ],
                 },
             ),
             Tool(
@@ -161,23 +208,6 @@ class WARFMCPServer:
                         "query_id": {"type": "string"},
                     },
                     "required": ["query_text", "packages"],
-                },
-            ),
-            Tool(
-                name="admit",
-                description="Explicitly publish a selected, arbitration-backed artifact to the Reason Registry. This is a network write and defaults to create-only.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "artifact": {"type": "object"},
-                        "arbitration": {"type": "object"},
-                        "expected_current_version": {
-                            "type": ["string", "null"],
-                            "pattern": "^sha256:[0-9a-f]{64}$",
-                            "default": None,
-                        },
-                    },
-                    "required": ["artifact", "arbitration"],
                 },
             ),
             Tool(
@@ -241,12 +271,46 @@ class WARFMCPServer:
                     artifact = self.memory.resolve(
                         address,
                         source=arguments.get("source", "local"),
+                        scope=arguments.get("scope"),
                         version=arguments.get("version"),
                         bypass_cache=bool(arguments.get("bypass_cache", False)),
                     )
                     if not artifact:
                         return self._text_result({"status": "not_found", "address": address})
                     return self._text_result(artifact)
+
+                if name == "contribute":
+                    has_text = "content" in arguments
+                    has_base64 = "content_base64" in arguments
+                    if has_text == has_base64:
+                        raise ValueError(
+                            "contribute requires exactly one of content or content_base64"
+                        )
+                    if has_base64:
+                        encoded = arguments.get("content_base64")
+                        if not isinstance(encoded, str):
+                            raise ValueError("content_base64 must be a string")
+                        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+                    else:
+                        content = arguments.get("content")
+                        if not isinstance(content, str):
+                            raise ValueError("content must be a string")
+                    result = self.memory.contribute(
+                        content,
+                        reason_address=arguments.get("reason_address", ""),
+                        scope=arguments.get("scope"),
+                        media_type=arguments.get(
+                            "media_type", "text/plain; charset=utf-8"
+                        ),
+                        project=arguments.get("project", "astrognosy"),
+                        tags=arguments.get("tags", []) or [],
+                        metadata=arguments.get("metadata"),
+                        context=arguments.get("context"),
+                        adapter=arguments.get("adapter"),
+                        background=not bool(arguments.get("flush", False)),
+                        flush=bool(arguments.get("flush", False)),
+                    )
+                    return self._text_result(result)
 
                 if name in {"network_resolve", "xchange_resolve"}:
                     uri = arguments.get("uri", "")

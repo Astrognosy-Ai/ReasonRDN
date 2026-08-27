@@ -3,8 +3,10 @@ rdn.client - Unified memory client for ReasonRDN.
 
 This package is the public local-first on-ramp for reason:// memory. It works
 entirely offline with a local SQLite-backed node. Explicit calls can arbitrate
-competing packages through the WARF Gateway and admit the selected result to
-the Reason Registry; local memory operations never trigger those network acts.
+competing packages through the WARF Gateway, resolve through configured layers,
+and queue organization or shared contributions durably. Local memory and local
+contributions never trigger network writes. Low-level admission remains for
+compatibility.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -25,12 +29,23 @@ import rfc8785
 from .addressing import project_address as _project_address
 from .artifact import (
     EVENT_RECORD_SCHEMA,
+    PROTOCOL_LOCK,
     ArtifactValidationError,
     ReasonArtifact,
     parse_reason_artifact,
     validate_reason_address,
 )
 from .config import env_flag
+from .contribution import (
+    CONTRIBUTION_IDEMPOTENCY_HEADER,
+    CONTRIBUTION_NETWORK_SCOPES,
+    CONTRIBUTION_NETWORK_ROUTE,
+    ContentInput,
+    ContributionEnvelope,
+    normalize_scope,
+    parse_contribution_envelope,
+    parse_contribution_receipt,
+)
 
 try:
     import requests  # Preferred for robustness
@@ -54,6 +69,11 @@ DEFAULT_DB_DIR = Path.home() / ".reason-rdn" / "private-node"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "warf-node.db"
 PORT_FILE = DEFAULT_DB_DIR / "private-node.port"
 CONFIG_FILE = Path.home() / ".reason-ecosystem.cfg"
+
+_RESOLVER_SCOPE_ORDER = tuple(
+    str(value) for value in PROTOCOL_LOCK["sdk"]["resolverChainOrder"]
+)
+_CONTRIBUTION_STALE_SENDING_SECONDS = 300.0
 
 # Public front door for deposits, shares, and arbitration.
 WARF_GATEWAY_URL = "https://warf.astrognosy.com"
@@ -117,6 +137,14 @@ def _hash_payload(payload: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 class RDNClient:
     """
     Unified client for depositing and retrieving ReasonRDN handoff artifacts.
@@ -139,6 +167,54 @@ class RDNClient:
         # Storage
         self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self._ensure_local_schema()
+        config = self._load_config()
+        resolver_config_value = config.get("resolvers")
+        resolver_config = (
+            dict(resolver_config_value)
+            if isinstance(resolver_config_value, Mapping)
+            else {}
+        )
+        self.default_scope = normalize_scope(
+            _first_env(
+                "REASON_RESOLUTION_SCOPE",
+                "RDN_RESOLUTION_SCOPE",
+                "REASON_SCOPE",
+                "RDN_SCOPE",
+            )
+            or config.get("resolution_scope")
+            or config.get("scope")
+            or "local"
+        )
+        self.resolvers: Dict[str, Optional[str]] = {
+            "organization": (
+                _first_env(
+                    "REASON_ORGANIZATION_RESOLVER",
+                    "RDN_ORGANIZATION_RESOLVER",
+                )
+                or resolver_config.get("organization")
+                or config.get("organization_resolver")
+                or None
+            ),
+            "shared": (
+                _first_env("REASON_SHARED_RESOLVER", "RDN_SHARED_RESOLVER")
+                or resolver_config.get("shared")
+                or config.get("shared_resolver")
+                or None
+            ),
+        }
+        self.resolvers = {
+            key: str(value).rstrip("/") if value else None
+            for key, value in self.resolvers.items()
+        }
+        try:
+            configured_attempts = int(config.get("contribution_max_attempts", 8))
+        except (TypeError, ValueError):
+            configured_attempts = 8
+        self.contribution_max_attempts = max(1, min(32, configured_attempts))
+        self._background_flush_lock = threading.Lock()
+        self._background_flush_wakeup = threading.Event()
+        self._background_flush_thread: Optional[threading.Thread] = None
+        self._last_resolution: Optional[Dict[str, Any]] = None
 
         # Node discovery priority:
         # 1. Explicit node_url param
@@ -152,7 +228,6 @@ class RDNClient:
         self.broker_url: Optional[str] = None
         self.xport_url: Optional[str] = None
 
-        config = self._load_config()
         network_env_keys = (
             "REASON_USE_NETWORK",
             "REASON_USE_XCHANGE",
@@ -198,6 +273,14 @@ class RDNClient:
         self.available = False
         if self.node_url:
             self.available = self._check_health()
+
+        # Shared is a known public resolver, but it is contacted only when the
+        # caller or configuration selects shared scope.  Local remains default.
+        self.resolvers["shared"] = (
+            self.resolvers.get("shared")
+            or self.xport_url
+            or REASON_REGISTRY_URL
+        )
 
         # For GUI / advanced features
         self._last_heartbeat_cache: Dict[str, Any] = {}
@@ -279,12 +362,85 @@ class RDNClient:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_warf_domain_time ON warf_artifacts(domain, deposited_at DESC)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rdn_contribution_queue (
+                    contribution_id TEXT PRIMARY KEY,
+                    queue_sequence INTEGER,
+                    scope TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    response_json TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            queue_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(rdn_contribution_queue)"
+                ).fetchall()
+            }
+            if "queue_sequence" not in queue_columns:
+                conn.execute(
+                    "ALTER TABLE rdn_contribution_queue ADD COLUMN queue_sequence INTEGER"
+                )
+            conn.execute(
+                """
+                UPDATE rdn_contribution_queue
+                SET queue_sequence = rowid
+                WHERE queue_sequence IS NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_rdn_contribution_sequence
+                ON rdn_contribution_queue(queue_sequence)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rdn_contribution_queue_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    next_sequence INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO rdn_contribution_queue_meta
+                (singleton, next_sequence) VALUES (1, 1)
+                """
+            )
+            conn.execute(
+                """
+                UPDATE rdn_contribution_queue_meta
+                SET next_sequence = MAX(
+                    next_sequence,
+                    COALESCE(
+                        (SELECT MAX(queue_sequence) + 1 FROM rdn_contribution_queue),
+                        1
+                    )
+                )
+                WHERE singleton = 1
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rdn_contribution_ready_sequence
+                ON rdn_contribution_queue(state, next_attempt_at, queue_sequence)
+                """
+            )
             conn.commit()
         finally:
             conn.close()
 
     def _get_conn(self):
-        return sqlite3.connect(str(self.db_path))
+        return sqlite3.connect(str(self.db_path), timeout=30.0)
 
     # ---------------- HTTP helpers ----------------
 
@@ -310,16 +466,23 @@ class RDNClient:
 
     def _http_post(self, url: str, payload: Dict[str, Any]) -> Optional[Dict]:
         try:
-            headers = self._auth_headers()
+            route = url.split("?", 1)[0].rstrip("/")
+            request_headers = (
+                self._warf_headers()
+                if route.endswith(("/arbitrate", "/share"))
+                else self._auth_headers()
+            )
             if requests:
-                r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+                r = requests.post(
+                    url, json=payload, headers=request_headers, timeout=self.timeout
+                )
                 r.raise_for_status()
                 return r.json()
             elif urllib_request:
                 data = json.dumps(payload).encode("utf-8")
                 req = urllib_request.Request(url, data=data, method="POST")
                 req.add_header("Content-Type", "application/json")
-                for k, v in (headers or {}).items():
+                for k, v in request_headers.items():
                     req.add_header(k, v)
                 with urllib_request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
@@ -353,14 +516,18 @@ class RDNClient:
         return error_type(int(status_code), message, payload)
 
     def _http_get_strict(
-        self, url: str, params: Optional[Dict[str, Any]] = None
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """GET JSON without collapsing HTTP status or transport failures."""
-        headers = self._auth_headers()
+        request_headers = {} if headers is None else dict(headers)
         if requests:
             try:
                 response = requests.get(
-                    url, params=params, headers=headers, timeout=self.timeout
+                    url, params=params, headers=request_headers, timeout=self.timeout
                 )
             except Exception as exc:
                 raise RDNTransportError(f"GET {url} failed: {exc}") from exc
@@ -377,7 +544,7 @@ class RDNClient:
 
             if params:
                 url = f"{url}?{urlencode(params)}"
-            request = urllib_request.Request(url, headers=headers)
+            request = urllib_request.Request(url, headers=request_headers)
             try:
                 with urllib_request.urlopen(request, timeout=self.timeout) as response:
                     payload = json.loads(response.read().decode("utf-8"))
@@ -441,22 +608,57 @@ class RDNClient:
         raise RDNTransportError("No HTTP client is available")
 
     def _auth_headers(self) -> Dict[str, str]:
-        token = (
-            os.environ.get("REASON_RDN_TOKEN")
-            or os.environ.get("RDN_AUTH_TOKEN")
-            or os.environ.get("WARF_API_KEY")
-            or os.environ.get("XPORT_API_KEY")
-        )
+        """Return only the private-node bearer credential.
+
+        Reason Registry, contribution intake, and WARF are separate service
+        boundaries and therefore use their own header builders below.
+        """
+        token = _first_env("REASON_RDN_TOKEN", "RDN_AUTH_TOKEN")
         if token:
             return {"Authorization": f"Bearer {token}"}
         return {}
 
     @staticmethod
+    def _registry_headers(scope: str = "shared") -> Dict[str, str]:
+        """Return one scope's resolver credential, never a WARF secret."""
+        normalized_scope = normalize_scope(scope, default="shared")
+        if normalized_scope == "local":
+            return {}
+        scope_name = normalized_scope.upper()
+        token = _first_env(
+            f"REASON_{scope_name}_REGISTRY_API_KEY",
+            f"REASON_{scope_name}_API_KEY",
+            "REASON_REGISTRY_API_KEY",
+            "XPORT_API_KEY",
+        )
+        return {"X-API-Key": token} if token else {}
+
+    @staticmethod
+    def _contribution_headers(scope: str) -> Dict[str, str]:
+        """Return one scope's network-intake credential in explicit precedence."""
+        normalized_scope = normalize_scope(scope)
+        if normalized_scope == "local":
+            return {}
+        scope_name = normalized_scope.upper()
+        token = _first_env(
+            f"REASON_{scope_name}_CONTRIBUTION_API_KEY",
+            f"REASON_{scope_name}_API_KEY",
+            "REASON_CONTRIBUTION_API_KEY",
+            "REASON_REGISTRY_API_KEY",
+            "XPORT_API_KEY",
+        )
+        return {"X-API-Key": token} if token else {}
+
+    @staticmethod
+    def _warf_headers() -> Dict[str, str]:
+        """Return only a WARF Gateway bearer credential."""
+        token = _first_env("WARF_API_KEY")
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    @staticmethod
     def _admission_headers() -> Dict[str, str]:
         """Use the Registry write credential without conflating WARF bearer auth."""
-        token = os.environ.get("REASON_REGISTRY_API_KEY") or os.environ.get(
-            "XPORT_API_KEY"
-        )
+        token = _first_env("REASON_REGISTRY_API_KEY", "XPORT_API_KEY")
         return {"X-API-Key": token} if token else {}
 
     # ------------------------------------------------------------------
@@ -480,6 +682,7 @@ class RDNClient:
         uri: str,
         bypass_cache: bool = False,
         version: Optional[str] = None,
+        scope: str = "shared",
     ) -> ReasonArtifact:
         """Resolve and verify one artifact at one exact Registry endpoint."""
         canonical_address = validate_reason_address(uri)
@@ -488,7 +691,13 @@ class RDNClient:
             params["version"] = version
         if bypass_cache:
             params["bypass_cache"] = True
-        data = self._http_get_strict(f"{target.rstrip('/')}/resolve", params=params)
+        resolve_url = f"{target.rstrip('/')}/resolve"
+        headers = self._registry_headers(scope)
+        data = (
+            self._http_get_strict(resolve_url, params=params, headers=headers)
+            if headers
+            else self._http_get_strict(resolve_url, params=params)
+        )
         artifact = parse_reason_artifact(data, source="registry")
         if artifact.address != canonical_address:
             raise ArtifactValidationError(
@@ -720,10 +929,35 @@ class RDNClient:
             **kwargs,
         )
 
-    def resolve_from_registry(self, uri: str, **kwargs) -> ReasonArtifact:
-        """Resolve a reason:// URI through the configured Reason Registry."""
-        target = self.xport_url or REASON_REGISTRY_URL
-        return self._resolve_reason_uri_at(target, uri, **kwargs)
+    def resolve_from_registry(
+        self,
+        uri: str,
+        *,
+        scope: Optional[str] = None,
+        **kwargs,
+    ) -> ReasonArtifact:
+        """Resolve through one selected network layer with its own credential.
+
+        An explicitly configured organization scope never falls through to the
+        public shared Registry.  For 0.5 compatibility, an explicit Registry
+        read with no network default still selects the shared reference layer.
+        """
+        selected_scope = normalize_scope(scope, default=self.default_scope)
+        if selected_scope == "local":
+            selected_scope = "shared"
+        target = self.resolvers.get(selected_scope)
+        if selected_scope == "shared":
+            if self.xport_url and (not target or target == REASON_REGISTRY_URL):
+                target = self.xport_url
+            target = target or REASON_REGISTRY_URL
+        if not target:
+            raise RDNUnavailableError(
+                503,
+                f"{selected_scope} resolver is not configured",
+            )
+        if selected_scope == "shared":
+            return self._resolve_reason_uri_at(target, uri, **kwargs)
+        return self._resolve_reason_uri_at(target, uri, scope=selected_scope, **kwargs)
 
     def resolve_from_xport(self, uri: str, **kwargs) -> ReasonArtifact:
         """
@@ -733,6 +967,613 @@ class RDNClient:
         This is the public registry path in the full architecture.
         """
         return self.resolve_from_registry(uri, **kwargs)
+
+    # ---------------- Scoped resolution and durable contributions ----------------
+
+    def resolver_status(self) -> Dict[str, Any]:
+        """Describe configured resolver layers without probing the network."""
+        return {
+            "default_scope": self.default_scope,
+            "order": list(_RESOLVER_SCOPE_ORDER),
+            "layers": {
+                "local": {
+                    "configured": True,
+                    "kind": "local-memory",
+                    "endpoint": self.node_url,
+                    "node_available": self.available,
+                },
+                "organization": {
+                    "configured": bool(self.resolvers.get("organization")),
+                    "kind": "reason-resolver",
+                    "endpoint": self.resolvers.get("organization"),
+                },
+                "shared": {
+                    "configured": bool(self.resolvers.get("shared")),
+                    "kind": "reason-resolver",
+                    "endpoint": self.resolvers.get("shared"),
+                },
+            },
+            "last_resolution": self._last_resolution,
+        }
+
+    def resolve_chain(
+        self,
+        address: str,
+        *,
+        scope: Optional[str] = None,
+        version: Optional[str] = None,
+        bypass_cache: bool = False,
+    ) -> Optional[ReasonArtifact]:
+        """Resolve local, then organization, then shared up to one selected scope.
+
+        This is an explicit chain mode.  The established ``source='local'`` and
+        ``source='registry'`` paths remain single-source operations.
+        """
+        canonical_address = validate_reason_address(address)
+        selected_scope = normalize_scope(scope, default=self.default_scope)
+        chain = _RESOLVER_SCOPE_ORDER[
+            : _RESOLVER_SCOPE_ORDER.index(selected_scope) + 1
+        ]
+        attempts: List[Dict[str, Any]] = []
+        for layer in chain:
+            if layer == "local":
+                try:
+                    artifact = self.resolve(
+                        canonical_address,
+                        source="local",
+                        version=version,
+                        bypass_cache=bypass_cache,
+                    )
+                except RDNConflictError as exc:
+                    attempts.append(
+                        {"scope": layer, "outcome": "version_miss", "detail": str(exc)}
+                    )
+                    continue
+                if artifact is not None:
+                    attempts.append({"scope": layer, "outcome": "resolved"})
+                    self._last_resolution = {
+                        "address": canonical_address,
+                        "selected_scope": selected_scope,
+                        "resolved_scope": layer,
+                        "version": artifact.version,
+                        "attempts": attempts,
+                    }
+                    return artifact
+                attempts.append({"scope": layer, "outcome": "not_found"})
+                continue
+
+            endpoint = self.resolvers.get(layer)
+            if not endpoint:
+                attempts.append({"scope": layer, "outcome": "not_configured"})
+                continue
+            try:
+                artifact = self._resolve_reason_uri_at(
+                    endpoint,
+                    canonical_address,
+                    version=version,
+                    bypass_cache=bypass_cache,
+                    scope=layer,
+                )
+            except RDNNotFoundError:
+                attempts.append({"scope": layer, "outcome": "not_found"})
+                continue
+            except RDNRequestError as exc:
+                attempts.append(
+                    {
+                        "scope": layer,
+                        "outcome": "unavailable",
+                        "detail": str(exc),
+                    }
+                )
+                continue
+            attempts.append({"scope": layer, "outcome": "resolved"})
+            self._last_resolution = {
+                "address": canonical_address,
+                "selected_scope": selected_scope,
+                "resolved_scope": layer,
+                "resolver": endpoint,
+                "version": artifact.version,
+                "attempts": attempts,
+            }
+            return artifact
+
+        self._last_resolution = {
+            "address": canonical_address,
+            "selected_scope": selected_scope,
+            "resolved_scope": None,
+            "version": version,
+            "attempts": attempts,
+        }
+        return None
+
+    def _store_contribution(self, envelope: ContributionEnvelope) -> Dict[str, Any]:
+        now = time.time()
+        initial_state = "local" if envelope.scope == "local" else "pending"
+        encoded = json.dumps(
+            envelope.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state FROM rdn_contribution_queue WHERE contribution_id = ?",
+                (envelope.contribution_id,),
+            ).fetchone()
+            if row is None:
+                queue_sequence = int(
+                    conn.execute(
+                        """
+                        SELECT next_sequence FROM rdn_contribution_queue_meta
+                        WHERE singleton = 1
+                        """
+                    ).fetchone()[0]
+                )
+                conn.execute(
+                    """
+                    INSERT INTO rdn_contribution_queue
+                    (contribution_id, queue_sequence, scope, envelope_json, state,
+                     attempts, next_attempt_at, last_error, response_json,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        envelope.contribution_id,
+                        queue_sequence,
+                        envelope.scope,
+                        encoded,
+                        initial_state,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE rdn_contribution_queue_meta
+                    SET next_sequence = ? WHERE singleton = 1
+                    """,
+                    (queue_sequence + 1,),
+                )
+            elif row[0] == "failed" and envelope.scope in CONTRIBUTION_NETWORK_SCOPES:
+                conn.execute(
+                    """
+                    UPDATE rdn_contribution_queue
+                    SET state = 'retry', attempts = 0, next_attempt_at = 0,
+                        last_error = NULL, updated_at = ?
+                    WHERE contribution_id = ?
+                    """,
+                    (now, envelope.contribution_id),
+                )
+        return self.inspect_contributions(
+            contribution_id=envelope.contribution_id, limit=1
+        )[0]
+
+    def contribute(
+        self,
+        content: ContentInput,
+        *,
+        reason_address: str,
+        scope: Optional[str] = None,
+        media_type: str = "text/plain; charset=utf-8",
+        project: str = "astrognosy",
+        tags: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        context: Optional[Mapping[str, Any]] = None,
+        adapter: Optional[Mapping[str, Any]] = None,
+        background: bool = True,
+        flush: bool = False,
+    ) -> Dict[str, Any]:
+        """Durably retain one reusable artifact and optionally deliver it.
+
+        Local scope is retained only in the local contribution ledger and never
+        performs an HTTP write. Organization and shared scopes are written to
+        SQLite before a bounded background or explicit synchronous flush.
+        """
+        envelope = ContributionEnvelope.create(
+            content,
+            reason_address=reason_address,
+            scope=normalize_scope(scope, default=self.default_scope),
+            media_type=media_type,
+            project=project,
+            tags=tuple(tags or ()),
+            metadata=metadata,
+            context=context,
+            adapter=adapter,
+        )
+        queued = self._store_contribution(envelope)
+        if envelope.scope == "local":
+            return {
+                "status": "retained",
+                "contribution_id": envelope.contribution_id,
+                "reason_address": envelope.reason_address,
+                "scope": envelope.scope,
+                "queue": queued,
+                "network_write": False,
+            }
+
+        if flush:
+            flush_result = self.flush_contributions(
+                limit=1, contribution_id=envelope.contribution_id
+            )
+            current = self.inspect_contributions(
+                contribution_id=envelope.contribution_id, limit=1
+            )[0]
+            return {
+                "status": current["state"],
+                "contribution_id": envelope.contribution_id,
+                "reason_address": envelope.reason_address,
+                "scope": envelope.scope,
+                "queue": current,
+                "flush": flush_result,
+                "network_write": flush_result["attempted"] > 0,
+            }
+
+        scheduled = self._schedule_background_flush() if background else False
+        return {
+            "status": queued["state"],
+            "contribution_id": envelope.contribution_id,
+            "reason_address": envelope.reason_address,
+            "scope": envelope.scope,
+            "queue": queued,
+            "background_flush_scheduled": scheduled,
+            "network_write": False,
+        }
+
+    def _schedule_background_flush(self) -> bool:
+        with self._background_flush_lock:
+            self._background_flush_wakeup.set()
+            if (
+                self._background_flush_thread is not None
+                and self._background_flush_thread.is_alive()
+            ):
+                return False
+            thread = threading.Thread(
+                target=self._background_flush_worker,
+                name="reason-rdn-contribution-flush",
+                daemon=True,
+            )
+            self._background_flush_thread = thread
+            thread.start()
+            return True
+
+    def _background_flush_worker(self) -> None:
+        """Drain ready work and wake bounded retries until no deliverable work remains."""
+        current_thread = threading.current_thread()
+        try:
+            while True:
+                self._background_flush_wakeup.clear()
+                result = self.flush_contributions(limit=10)
+                queue = result.get("queue") or self.contribution_queue_status()
+                states = queue.get("states") or {}
+                pending = int(states.get("pending", 0) or 0)
+                retrying = int(states.get("retry", 0) or 0)
+                selected = int(result.get("selected", 0) or 0)
+                outcomes = result.get("outcomes") or []
+                all_not_configured = bool(outcomes) and all(
+                    item.get("status") == "not_configured" for item in outcomes
+                )
+
+                # Drain additional immediate batches, including contributions
+                # queued while the previous network request was in flight.
+                if pending and selected and not all_not_configured:
+                    continue
+
+                # Retry backoff is bounded by the queue attempt cap and the
+                # five-minute per-attempt ceiling in flush_contributions().
+                if retrying:
+                    next_retry = queue.get("next_retry_at")
+                    if next_retry is None:
+                        break
+                    delay = max(0.0, min(300.0, float(next_retry) - time.time()))
+                    self._background_flush_wakeup.wait(timeout=delay)
+                    continue
+
+                if self._background_flush_wakeup.is_set():
+                    continue
+                with self._background_flush_lock:
+                    if self._background_flush_wakeup.is_set():
+                        continue
+                    if self._background_flush_thread is current_thread:
+                        self._background_flush_thread = None
+                    return
+        finally:
+            restart = False
+            with self._background_flush_lock:
+                if self._background_flush_thread is current_thread:
+                    self._background_flush_thread = None
+                    restart = self._background_flush_wakeup.is_set()
+            if restart:
+                self._schedule_background_flush()
+
+    def inspect_contributions(
+        self,
+        *,
+        limit: int = 20,
+        state: Optional[str] = None,
+        contribution_id: Optional[str] = None,
+        include_envelope: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Inspect durable queue state without performing a network action."""
+        limit = max(1, min(200, int(limit or 20)))
+        sql = """
+            SELECT contribution_id, queue_sequence, scope, envelope_json, state,
+                   attempts, next_attempt_at, last_error, response_json,
+                   created_at, updated_at
+            FROM rdn_contribution_queue WHERE 1=1
+        """
+        params: List[Any] = []
+        if state is not None:
+            sql += " AND state = ?"
+            params.append(str(state))
+        if contribution_id is not None:
+            sql += " AND contribution_id = ?"
+            params.append(str(contribution_id))
+        sql += " ORDER BY queue_sequence ASC LIMIT ?"
+        params.append(limit)
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            item: Dict[str, Any] = {
+                "contribution_id": row["contribution_id"],
+                "queue_sequence": int(row["queue_sequence"]),
+                "scope": row["scope"],
+                "state": row["state"],
+                "attempts": int(row["attempts"]),
+                "next_attempt_at": float(row["next_attempt_at"]),
+                "last_error": row["last_error"],
+                "response": (
+                    json.loads(row["response_json"])
+                    if row["response_json"]
+                    else None
+                ),
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            if include_envelope:
+                item["envelope"] = parse_contribution_envelope(
+                    json.loads(row["envelope_json"])
+                ).to_dict()
+            results.append(item)
+        return results
+
+    def contribution_queue_status(self) -> Dict[str, Any]:
+        """Return compact queue counts for CLI, SDK, and MCP status."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT scope, state, COUNT(*)
+                FROM rdn_contribution_queue
+                GROUP BY scope, state
+                ORDER BY scope, state
+                """
+            ).fetchall()
+            next_retry = conn.execute(
+                """
+                SELECT MIN(next_attempt_at) FROM rdn_contribution_queue
+                WHERE state = 'retry'
+                """
+            ).fetchone()[0]
+        by_scope: Dict[str, Dict[str, int]] = {
+            scope: {} for scope in _RESOLVER_SCOPE_ORDER
+        }
+        totals: Dict[str, int] = {}
+        for scope, state, count in rows:
+            by_scope.setdefault(scope, {})[state] = int(count)
+            totals[state] = totals.get(state, 0) + int(count)
+        return {
+            "total": sum(totals.values()),
+            "ready": totals.get("pending", 0) + totals.get("retry", 0),
+            "states": totals,
+            "by_scope": by_scope,
+            "next_retry_at": float(next_retry) if next_retry is not None else None,
+            "max_attempts": self.contribution_max_attempts,
+        }
+
+    def flush_contributions(
+        self,
+        *,
+        limit: int = 10,
+        retry_failed: bool = False,
+        contribution_id: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Attempt a bounded queue batch and schedule deterministic retries."""
+        limit = max(1, min(100, int(limit or 10)))
+        current_time = float(time.time() if now is None else now)
+        with self._get_conn() as conn:
+            if retry_failed:
+                retry_sql = """
+                    UPDATE rdn_contribution_queue
+                    SET state = 'retry', attempts = 0, next_attempt_at = 0,
+                        last_error = NULL, updated_at = ?
+                    WHERE state = 'failed'
+                """
+                retry_params: List[Any] = [current_time]
+                if contribution_id is not None:
+                    retry_sql += " AND contribution_id = ?"
+                    retry_params.append(contribution_id)
+                conn.execute(retry_sql, retry_params)
+            conn.execute(
+                """
+                UPDATE rdn_contribution_queue
+                SET state = 'retry', next_attempt_at = 0,
+                    last_error = 'recovered stale in-flight attempt', updated_at = ?
+                WHERE state = 'sending' AND updated_at <= ?
+                """,
+                (current_time, current_time - _CONTRIBUTION_STALE_SENDING_SECONDS),
+            )
+            configured_scopes = [
+                scope
+                for scope in CONTRIBUTION_NETWORK_SCOPES
+                if self.resolvers.get(scope)
+            ]
+            select_sql = f"""
+                SELECT contribution_id, queue_sequence, scope, envelope_json,
+                       state, attempts
+                FROM rdn_contribution_queue
+                WHERE state IN ('pending', 'retry')
+                  AND next_attempt_at <= ?
+                  AND scope IN ({", ".join("?" for _ in configured_scopes)})
+            """
+            select_params: List[Any] = [current_time, *configured_scopes]
+            if contribution_id is not None:
+                select_sql += " AND contribution_id = ?"
+                select_params.append(contribution_id)
+            select_sql += " ORDER BY queue_sequence ASC LIMIT ?"
+            select_params.append(limit)
+            conn.row_factory = sqlite3.Row
+            rows = (
+                conn.execute(select_sql, select_params).fetchall()
+                if configured_scopes
+                else []
+            )
+            conn.commit()
+
+        outcomes: List[Dict[str, Any]] = []
+        for row in rows:
+            contribution_key = str(row["contribution_id"])
+            prior_state = str(row["state"])
+            with self._get_conn() as conn:
+                claimed = conn.execute(
+                    """
+                    UPDATE rdn_contribution_queue
+                    SET state = 'sending', updated_at = ?
+                    WHERE contribution_id = ? AND state = ?
+                    """,
+                    (current_time, contribution_key, prior_state),
+                ).rowcount
+                conn.commit()
+            if not claimed:
+                continue
+
+            endpoint = self.resolvers.get(str(row["scope"]))
+            if not endpoint:
+                with self._get_conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE rdn_contribution_queue
+                        SET state = 'pending', last_error = 'resolver not configured',
+                            updated_at = ? WHERE contribution_id = ?
+                        """,
+                        (current_time, contribution_key),
+                    )
+                    conn.commit()
+                outcomes.append(
+                    {
+                        "contribution_id": contribution_key,
+                        "status": "not_configured",
+                    }
+                )
+                continue
+
+            try:
+                envelope = parse_contribution_envelope(
+                    json.loads(str(row["envelope_json"]))
+                )
+                headers = self._contribution_headers(str(row["scope"]))
+                headers[CONTRIBUTION_IDEMPOTENCY_HEADER] = contribution_key
+                response_payload = self._http_post_strict(
+                    f"{endpoint.rstrip('/')}{CONTRIBUTION_NETWORK_ROUTE}",
+                    envelope.to_dict(),
+                    headers=headers,
+                )
+                response = parse_contribution_receipt(
+                    response_payload,
+                    envelope=envelope,
+                )
+            except Exception as exc:
+                attempts = int(row["attempts"]) + 1
+                terminal_rejection = (
+                    isinstance(exc, RDNHTTPError) and exc.status_code == 413
+                )
+                exhausted = terminal_rejection or (
+                    attempts >= self.contribution_max_attempts
+                )
+                next_attempt = (
+                    0.0
+                    if exhausted
+                    else current_time + min(300.0, float(2 ** max(0, attempts - 1)))
+                )
+                state_value = (
+                    "rejected"
+                    if terminal_rejection
+                    else "failed"
+                    if exhausted
+                    else "retry"
+                )
+                with self._get_conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE rdn_contribution_queue
+                        SET state = ?, attempts = ?, next_attempt_at = ?,
+                            last_error = ?, updated_at = ?
+                        WHERE contribution_id = ?
+                        """,
+                        (
+                            state_value,
+                            attempts,
+                            next_attempt,
+                            str(exc),
+                            current_time,
+                            contribution_key,
+                        ),
+                    )
+                    conn.commit()
+                outcomes.append(
+                    {
+                        "contribution_id": contribution_key,
+                        "status": state_value,
+                        "attempts": attempts,
+                        "next_attempt_at": next_attempt or None,
+                        "retryable": not exhausted,
+                    }
+                )
+                continue
+
+            attempts = int(row["attempts"]) + 1
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE rdn_contribution_queue
+                    SET state = 'delivered', attempts = ?, next_attempt_at = 0,
+                        last_error = NULL, response_json = ?, updated_at = ?
+                    WHERE contribution_id = ?
+                    """,
+                    (
+                        attempts,
+                        json.dumps(response, ensure_ascii=True, sort_keys=True),
+                        current_time,
+                        contribution_key,
+                    ),
+                )
+                conn.commit()
+            outcomes.append(
+                {
+                    "contribution_id": contribution_key,
+                    "status": "delivered",
+                    "attempts": attempts,
+                    "response": response,
+                }
+            )
+
+        return {
+            "selected": len(rows),
+            "attempted": sum(
+                1 for item in outcomes if item["status"] != "not_configured"
+            ),
+            "delivered": sum(
+                1 for item in outcomes if item["status"] == "delivered"
+            ),
+            "outcomes": outcomes,
+            "queue": self.contribution_queue_status(),
+        }
+
+    def runtime_status(self) -> Dict[str, Any]:
+        """Return queue and resolver state without network side effects."""
+        return {
+            "resolvers": self.resolver_status(),
+            "contributions": self.contribution_queue_status(),
+        }
 
     def list_prefix(self, prefix: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
@@ -1007,19 +1848,29 @@ class RDNClient:
         address: str,
         *,
         source: str = "local",
+        scope: Optional[str] = None,
         version: Optional[str] = None,
         bypass_cache: bool = False,
     ) -> Optional[ReasonArtifact]:
-        """Resolve from exactly one selected source; local is the default."""
+        """Resolve from one source or an explicitly selected scoped chain."""
         canonical_address = validate_reason_address(address)
-        if source == "registry":
-            return self.resolve_from_registry(
+        if source == "chain":
+            return self.resolve_chain(
                 canonical_address,
+                scope=scope,
                 version=version,
                 bypass_cache=bypass_cache,
             )
+        if source == "registry":
+            registry_kwargs: Dict[str, Any] = {
+                "version": version,
+                "bypass_cache": bypass_cache,
+            }
+            if scope is not None:
+                registry_kwargs["scope"] = scope
+            return self.resolve_from_registry(canonical_address, **registry_kwargs)
         if source != "local":
-            raise ValueError("source must be 'local' or 'registry'")
+            raise ValueError("source must be 'local', 'registry', or 'chain'")
 
         if self.node_url and self.available:
             res = self._http_get(
@@ -1075,7 +1926,7 @@ class RDNClient:
     # ---------------- GUI / Advanced helpers (heartbeat, recent projects) ----------------
 
     def get_heartbeat(self, project: Optional[str] = None) -> str:
-        """ASCII sparkline of activity over the last 7 days (░ ▒ ▓ █)."""
+        """ASCII sparkline of activity over the last 7 days (. : * #)."""
         try:
             if self.node_url and self.available:
                 # Ask for a broad recent set
@@ -1114,16 +1965,16 @@ class RDNClient:
                 day = (datetime.now(timezone.utc).date() - __import__("datetime").timedelta(days=i)).isoformat()
                 c = counts.get(day, 0)
                 if c == 0:
-                    spark += "░"
+                    spark += "."
                 elif c < 3:
-                    spark += "▒"
+                    spark += ":"
                 elif c < 6:
-                    spark += "▓"
+                    spark += "*"
                 else:
-                    spark += "█"
+                    spark += "#"
             return spark
         except Exception:
-            return "░░░░░░░"
+            return "......."
 
     def get_recent_projects(self, limit: int = 10) -> List[str]:
         """Most recently active projects (domains)."""
