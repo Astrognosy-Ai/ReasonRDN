@@ -1926,7 +1926,7 @@ class RDNClient:
     # ---------------- GUI / Advanced helpers (heartbeat, recent projects) ----------------
 
     def get_heartbeat(self, project: Optional[str] = None) -> str:
-        """ASCII sparkline of activity over the last 7 days (░ ▒ ▓ █)."""
+        """ASCII sparkline of activity over the last 7 days (. : * #)."""
         try:
             if self.node_url and self.available:
                 # Ask for a broad recent set
@@ -1965,16 +1965,16 @@ class RDNClient:
                 day = (datetime.now(timezone.utc).date() - __import__("datetime").timedelta(days=i)).isoformat()
                 c = counts.get(day, 0)
                 if c == 0:
-                    spark += "░"
+                    spark += "."
                 elif c < 3:
-                    spark += "▒"
+                    spark += ":"
                 elif c < 6:
-                    spark += "▓"
+                    spark += "*"
                 else:
-                    spark += "█"
+                    spark += "#"
             return spark
         except Exception:
-            return "░░░░░░░"
+            return "......."
 
     def get_recent_projects(self, limit: int = 10) -> List[str]:
         """Most recently active projects (domains)."""
