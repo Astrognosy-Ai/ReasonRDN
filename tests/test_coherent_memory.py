@@ -117,6 +117,17 @@ def test_local_fallback_when_no_node():
     assert "fallback" in rec[0].get("content", "").lower() or "local" in rec[0].get("content", "").lower()
 
 
+def test_heartbeat_is_ascii_for_windows_consoles(tmp_path):
+    client = RDNClient(db_path=tmp_path / "heartbeat.db")
+    client.available = False
+    client.node_url = None
+
+    heartbeat = client.get_heartbeat()
+
+    assert heartbeat.isascii()
+    assert len(heartbeat) == 7
+
+
 def test_harness_metrics_record_functions(tmp_path, monkeypatch):
     """Test the public record_handoff / record_recall helpers.
 

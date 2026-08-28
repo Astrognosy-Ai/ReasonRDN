@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reason-rdn"
-version = "0.5.0"
+version = "0.6.0"
 description = "ReasonRDN - local-first agent memory, reason:// handoffs, and optional WARF arbitration through a unified Python, CLI, MCP, and embedded-node surface."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,6 +34,11 @@ dependencies = [
 gui = ["customtkinter>=5.2.0"]
 mcp = ["mcp>=1.0.0"]
 dash = ["streamlit>=1.30.0", "plotly>=5.0.0"]
+doclang = ["doclang>=0.7.3,<0.8; python_version >= '3.10'"]
+documents = [
+  "doclang>=0.7.3,<0.8; python_version >= '3.10'",
+  "docling>=2.119,<3; python_version >= '3.10'",
+]
 full = ["customtkinter>=5.2.0", "mcp>=1.0.0", "streamlit>=1.30.0", "plotly>=5.0.0"]
 dev = ["pytest", "pyinstaller", "httpx", "black", "ruff"]
 
