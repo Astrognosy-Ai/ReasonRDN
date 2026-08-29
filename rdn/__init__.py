@@ -18,7 +18,7 @@ This package is the open public on-ramp to the reason:// ecosystem.
 
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from .artifact import (
     CANONICAL_ARTIFACT_FIELDS,
