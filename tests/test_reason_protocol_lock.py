@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import pytest
 import rfc8785
@@ -360,6 +361,15 @@ def test_mcp_advertises_exactly_the_six_locked_tools():
         "xchange_share",
         "harness_status",
     }.intersection(names)
+
+
+def test_mcp_extras_stay_on_the_compatible_major_version():
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+
+    assert pyproject.count('"mcp>=1.0.0,<2"') == 2
+    assert '"mcp>=1.0.0"' not in pyproject
 
 
 def test_cli_plain_resolve_stays_local_despite_ambient_network(monkeypatch):
