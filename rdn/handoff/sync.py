@@ -25,7 +25,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from rdn.handoff.protocol import ReasonRDN
 
-DEFAULT_ROOT = os.environ.get("RDN_REPO_ROOT", r"C:\Users\Scooter\Coworker\Projects\GitHub")
+def _default_repo_root() -> str:
+    """Return the configured repository root, or the current working directory."""
+    return os.environ.get("RDN_REPO_ROOT", os.getcwd())
+
+
+DEFAULT_ROOT = _default_repo_root()
 DEFAULT_INTERVAL = int(os.environ.get("RDN_SCAN_INTERVAL", "300"))
 DEFAULT_NODE_URL = os.environ.get("RDN_NODE_URL") or os.environ.get("WARF_NODE_URL") or os.environ.get("REASON_NODE_URL")
 # For optional WARF networking, prefer REASON_USE_NETWORK=1. Legacy Xchange names remain compatible.

@@ -1,6 +1,6 @@
 {
   "$id": "astrognosy.reason-artifact/v1",
-  "packageVersion": "0.6.0",
+  "packageVersion": "0.6.1",
   "eventRecordSchema": "https://warf.astrognosy.com/schemas/event-record/v2",
   "registryValidationMethods": [
     "https://warf.astrognosy.com/schemas/event-record/v2",
