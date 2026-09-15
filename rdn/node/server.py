@@ -6,7 +6,9 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -74,6 +76,49 @@ def ensure_schema(db_path: str) -> None:
 
 def _hash_payload(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Tokenized recall helpers (mirrors rdn.client, no shared import to keep the
+# node self-contained)
+# ---------------------------------------------------------------------------
+
+_RECALL_STOPWORDS: frozenset = frozenset({
+    "what", "who", "how", "why", "when", "where", "which",
+    "does", "do", "did", "is", "are", "should", "could", "would", "can",
+    "i", "me", "my", "the", "a", "an", "of", "for", "to", "in", "on",
+    "and", "or",
+})
+
+
+def _tokenize_query(query: str) -> List[str]:
+    """Tokenize a recall query, preserving compound tokens like PILOT-025."""
+    raw_parts = re.split(r"[^\w.\-]+", query.lower())
+    tokens: List[str] = []
+    seen: set = set()
+
+    def _add(tok: str) -> None:
+        tok = tok.strip(".-")
+        if tok and tok not in _RECALL_STOPWORDS and tok not in seen:
+            tokens.append(tok)
+            seen.add(tok)
+
+    for part in raw_parts:
+        _add(part)
+        if "-" in part or "." in part:
+            for sub in re.split(r"[.-]", part):
+                _add(sub)
+
+    return tokens
+
+
+def _idf_score(tokens: List[str], all_haystacks: List[str], n_docs: int) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    for tok in tokens:
+        df = sum(1 for h in all_haystacks if tok in h) or 1
+        weights[tok] = math.log(n_docs / df)
+    return weights
+
 
 
 class PrivateWARFNodeServer(ThreadingHTTPServer):
@@ -273,15 +318,22 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _recall(self, query: str, project: Optional[str], limit: int) -> List[Dict[str, Any]]:
-        needle = query.lower().strip()
-        results: List[Dict[str, Any]] = []
+        raw_query = query.strip()
+        needle = raw_query.lower()
 
-        for row in self._fetch_rows(project, limit):
+        tokens = _tokenize_query(raw_query) if raw_query else []
+        use_token_search = bool(tokens)
+
+        # Fetch a larger candidate set so we can score and re-rank
+        candidate_rows = self._fetch_rows(project, limit * 10)
+
+        parsed: List[tuple] = []
+        all_haystacks: List[str] = []
+        for row in candidate_rows:
             try:
                 meta = json.loads(row["metadata_json"])
             except json.JSONDecodeError:
                 continue
-
             haystack = " ".join(
                 [
                     row["address"],
@@ -290,26 +342,45 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
                     json.dumps(meta, ensure_ascii=True),
                 ]
             ).lower()
+            parsed.append((row, meta, haystack))
+            all_haystacks.append(haystack)
 
-            if needle and needle not in haystack:
-                continue
+        n_docs = len(parsed) or 1
+        idf = _idf_score(tokens, all_haystacks, n_docs) if use_token_search else {}
 
-            results.append(
-                {
-                    "address": row["address"],
-                    "project": row["domain"],
-                    "deposited_at": row["deposited_at"],
-                    "content": meta.get("content", ""),
-                    "tags": meta.get("tags", []),
-                    "meta": meta,
-                    "source": "node",
-                }
+        scored: List[tuple] = []
+        for row, meta, haystack in parsed:
+            if use_token_search:
+                matched = [tok for tok in tokens if tok in haystack]
+                if not matched:
+                    continue
+                score = sum(idf[tok] for tok in matched)
+                if needle and needle in haystack:
+                    score += 5.0
+                tags_str = " ".join(meta.get("tags", []) or []).lower()
+                score += 0.5 * sum(1 for tok in matched if tok in tags_str)
+            else:
+                if needle and needle not in haystack:
+                    continue
+                score = 0.0
+
+            scored.append(
+                (
+                    score,
+                    {
+                        "address": row["address"],
+                        "project": row["domain"],
+                        "deposited_at": row["deposited_at"],
+                        "content": meta.get("content", ""),
+                        "tags": meta.get("tags", []),
+                        "meta": meta,
+                        "source": "node",
+                    },
+                )
             )
 
-            if len(results) >= limit:
-                break
-
-        return results
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[:limit]]
 
     def _resolve(self, address: str) -> Optional[Dict[str, Any]]:
         conn = sqlite3.connect(self._db_path)
