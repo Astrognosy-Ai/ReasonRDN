@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import math
 import re
 import sqlite3
 import threading
@@ -143,6 +144,68 @@ def _first_env(*names: str) -> Optional[str]:
         if value and value.strip():
             return value.strip()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Tokenized recall helpers
+# ---------------------------------------------------------------------------
+
+#: English stopwords and interrogatives stripped before token matching.
+_RECALL_STOPWORDS: frozenset = frozenset({
+    "what", "who", "how", "why", "when", "where", "which",
+    "does", "do", "did", "is", "are", "should", "could", "would", "can",
+    "i", "me", "my", "the", "a", "an", "of", "for", "to", "in", "on",
+    "and", "or",
+})
+
+
+def _tokenize_query(query: str) -> List[str]:
+    """Return meaningful lowercase search tokens from *query*.
+
+    Rules:
+    - Split on whitespace and characters that are not alphanumeric, ``-``, or ``.``
+      so that ``PILOT-025`` and ``0.6.1`` survive intact.
+    - Also index each sub-part of compound tokens split by ``-`` / ``.``,
+      e.g. ``PILOT-025`` additionally yields ``pilot`` and ``025``.
+    - Strip leading/trailing ``-`` and ``.`` from each token.
+    - Remove English stopwords (see ``_RECALL_STOPWORDS``).
+    - Return a deduped list preserving first-occurrence order.
+    """
+    raw_parts = re.split(r"[^\w.\-]+", query.lower())
+    tokens: List[str] = []
+    seen: set = set()
+
+    def _add(tok: str) -> None:
+        tok = tok.strip(".-")
+        if tok and tok not in _RECALL_STOPWORDS and tok not in seen:
+            tokens.append(tok)
+            seen.add(tok)
+
+    for part in raw_parts:
+        _add(part)
+        # Also add sub-parts of compound tokens
+        if "-" in part or "." in part:
+            for sub in re.split(r"[.-]", part):
+                _add(sub)
+
+    return tokens
+
+
+def _idf_score(
+    tokens: List[str],
+    all_haystacks: List[str],
+    n_docs: int,
+) -> Dict[str, float]:
+    """Return IDF weight per token: ``log(n_docs / df)``.
+
+    ``df`` is clamped to at least 1 so we never divide by zero.
+    """
+    weights: Dict[str, float] = {}
+    for tok in tokens:
+        df = sum(1 for h in all_haystacks if tok in h) or 1
+        weights[tok] = math.log(n_docs / df)
+    return weights
+
 
 
 class RDNClient:
@@ -1779,8 +1842,12 @@ class RDNClient:
         project: Optional[str],
         limit: int,
     ) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        needle = (query or "").lower().strip()
+        raw_query = (query or "").strip()
+        needle = raw_query.lower()
+
+        # Tokenize for OR-style matching; fall back to substring if all stopwords
+        tokens = _tokenize_query(raw_query) if raw_query else []
+        use_token_search = bool(tokens)
 
         conn = self._get_conn()
         try:
@@ -1792,18 +1859,20 @@ class RDNClient:
                 sql += " AND domain = ?"
                 params.append(project)
 
-            # We fetch a bit more then filter in Python for simplicity and correctness
+            # Fetch a larger candidate set so scoring can re-rank across all rows
             sql += " ORDER BY deposited_at DESC LIMIT ?"
-            params.append(limit * 3)
+            params.append(limit * 10)
 
             rows = conn.execute(sql, params).fetchall()
 
+            # Parse all rows up front so we can compute IDF across the candidate set
+            parsed: List[tuple] = []
+            all_haystacks: List[str] = []
             for row in rows:
                 try:
                     meta = json.loads(row["metadata_json"])
                 except Exception:
                     continue
-
                 haystack = " ".join(
                     [
                         row["address"] or "",
@@ -1812,9 +1881,31 @@ class RDNClient:
                         json.dumps(meta, ensure_ascii=True),
                     ]
                 ).lower()
+                parsed.append((row, meta, haystack))
+                all_haystacks.append(haystack)
 
-                if needle and needle not in haystack:
-                    continue
+            n_docs = len(parsed) or 1
+            idf = _idf_score(tokens, all_haystacks, n_docs) if use_token_search else {}
+
+            scored: List[tuple] = []
+            for row, meta, haystack in parsed:
+                if use_token_search:
+                    matched = [tok for tok in tokens if tok in haystack]
+                    if not matched:
+                        continue
+                    # Base score: sum of IDF weights for matched tokens
+                    score = sum(idf[tok] for tok in matched)
+                    # Bonus when the original phrase appears verbatim
+                    if needle and needle in haystack:
+                        score += 5.0
+                    # Smaller bonus for token hits inside the tags field
+                    tags_str = " ".join(meta.get("tags", []) or []).lower()
+                    score += 0.5 * sum(1 for tok in matched if tok in tags_str)
+                else:
+                    # All tokens were stopwords — fall back to substring match
+                    if needle and needle not in haystack:
+                        continue
+                    score = 0.0
 
                 if tags:
                     entry_tags = meta.get("tags", []) or []
@@ -1823,21 +1914,27 @@ class RDNClient:
                     ):
                         continue
 
-                results.append(
-                    {
-                        "address": row["address"],
-                        "project": row["domain"],
-                        "deposited_at": row["deposited_at"],
-                        "content": meta.get("content", ""),
-                        "tags": meta.get("tags", []),
-                        "meta": meta,
-                        "source": "local",
-                    }
+                scored.append(
+                    (
+                        score,
+                        {
+                            "address": row["address"],
+                            "project": row["domain"],
+                            "deposited_at": row["deposited_at"],
+                            "content": meta.get("content", ""),
+                            "tags": meta.get("tags", []),
+                            "meta": meta,
+                            "source": "local",
+                        },
+                    )
                 )
-                if len(results) >= limit:
-                    break
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results: List[Dict[str, Any]] = [item for _, item in scored[:limit]]
+
         except Exception as e:
             logger.error("Local recall failed: %s", e)
+            results = []
         finally:
             conn.close()
 
