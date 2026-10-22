@@ -4,7 +4,6 @@ Submitted Internet-Draft versions are authoritative on IETF Datatracker:
 
 - [draft-westerbeck-reason-protocol](https://datatracker.ietf.org/doc/draft-westerbeck-reason-protocol/)
 - [draft-westerbeck-warf-protocol](https://datatracker.ietf.org/doc/draft-westerbeck-warf-protocol/)
-- [Jacob Westerbeck's Datatracker profile](https://datatracker.ietf.org/person/jacob%40pcfic.com)
 
 ReasonRDN does not carry unpublished draft source. Private working RFCXML for
 the next revisions lives with the canonical reference-network implementation

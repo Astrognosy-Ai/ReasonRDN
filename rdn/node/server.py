@@ -89,7 +89,7 @@ _RECALL_STOPWORDS: frozenset = frozenset({
 
 
 def _tokenize_query(query: str) -> List[str]:
-    """Tokenize a recall query, preserving compound tokens like PILOT-025."""
+    """Tokenize a recall query, preserving compound tokens like ISSUE-025."""
     raw_parts = re.split(r"[^\w.\-]+", query.lower())
     tokens: List[str] = []
     seen: set = set()

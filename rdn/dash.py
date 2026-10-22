@@ -162,7 +162,7 @@ def render_fingerprint_viz(artifact_hash: str, label: str = "ARTIFACT HASH") -> 
 
 
 # ============================================================
-#  THE ACTUAL DASHBOARD — ALL STREAMLIT CODE LIVES INSIDE _app()
+#  THE ACTUAL DASHBOARD: ALL STREAMLIT CODE LIVES INSIDE _app()
 # ============================================================
 
 def _app():
@@ -437,7 +437,7 @@ def _app():
 
 
 # ============================================================
-#  THIN LAUNCHER — ONLY FOR CONSOLE SCRIPT / DIRECT EXECUTION
+#  THIN LAUNCHER: ONLY FOR CONSOLE SCRIPT / DIRECT EXECUTION
 # ============================================================
 
 def build_launch_args(port: int = DEFAULT_PORT, network: bool = False) -> List[str]:

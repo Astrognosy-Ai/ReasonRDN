@@ -1986,7 +1986,7 @@ class RDNClient:
                     tags_str = " ".join(meta.get("tags", []) or []).lower()
                     score += 0.5 * sum(1 for tok in matched if tok in tags_str)
                 else:
-                    # All tokens were stopwords — fall back to substring match
+                    # All tokens were stopwords: fall back to substring match
                     if needle and needle not in haystack:
                         continue
                     score = 0.0

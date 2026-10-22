@@ -145,7 +145,7 @@ def open_dashboard(dash_port=8501, node_port=8765):
         # Give Streamlit time
         time.sleep(5)
         
-        # Check if the streamlit process died quickly — this is the usual cause of "localhost refused to connect"
+        # Check if the streamlit process died quickly: this is the usual cause of "localhost refused to connect"
         if proc.poll() is not None:
             out, err = proc.communicate()
             print("[rdn] Streamlit process exited early (this is almost always a missing-data bundling problem).")

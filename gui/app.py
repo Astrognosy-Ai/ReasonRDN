@@ -40,7 +40,7 @@ class ReasonRDNApp(ctk.CTk):
         self.title("ReasonRDN Console")
         self.geometry("960x700")
 
-        # Set theme to match Astrognosy/Laminar aesthetic
+        # Set theme to match the Astrognosy look
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
