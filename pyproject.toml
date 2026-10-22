@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reason-rdn"
-version = "0.6.2"
+version = "0.6.3"
 description = "A local memory store for AI agents: save notes, find them later, and keep reusable answers at fixed reason:// addresses."
 readme = "README.md"
 requires-python = ">=3.9"
