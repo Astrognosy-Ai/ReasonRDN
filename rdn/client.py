@@ -16,7 +16,6 @@ import hmac
 import json
 import logging
 import os
-import math
 import re
 import sqlite3
 import threading
@@ -36,7 +35,8 @@ from .artifact import (
     parse_reason_artifact,
     validate_reason_address,
 )
-from .config import config_file, data_dir, env_flag
+from .config import NO_NODE_ENV, config_file, data_dir, env_flag, node_lookup_disabled
+from . import notes as _notes
 from .contribution import (
     CONTRIBUTION_IDEMPOTENCY_HEADER,
     CONTRIBUTION_NETWORK_SCOPES,
@@ -150,62 +150,12 @@ def _first_env(*names: str) -> Optional[str]:
 # Tokenized recall helpers
 # ---------------------------------------------------------------------------
 
-#: English stopwords and interrogatives stripped before token matching.
-_RECALL_STOPWORDS: frozenset = frozenset({
-    "what", "who", "how", "why", "when", "where", "which",
-    "does", "do", "did", "is", "are", "should", "could", "would", "can",
-    "i", "me", "my", "the", "a", "an", "of", "for", "to", "in", "on",
-    "and", "or",
-})
+#: English stopwords and question words removed before matching.
+_RECALL_STOPWORDS: frozenset = _notes.RECALL_STOPWORDS
 
-
-def _tokenize_query(query: str) -> List[str]:
-    """Return meaningful lowercase search tokens from *query*.
-
-    Rules:
-    - Split on whitespace and characters that are not alphanumeric, ``-``, or ``.``
-      so that ``ISSUE-025`` and ``0.6.1`` survive intact.
-    - Also index each sub-part of compound tokens split by ``-`` / ``.``,
-      e.g. ``ISSUE-025`` additionally yields ``issue`` and ``025``.
-    - Strip leading/trailing ``-`` and ``.`` from each token.
-    - Remove English stopwords (see ``_RECALL_STOPWORDS``).
-    - Return a deduped list preserving first-occurrence order.
-    """
-    raw_parts = re.split(r"[^\w.\-]+", query.lower())
-    tokens: List[str] = []
-    seen: set = set()
-
-    def _add(tok: str) -> None:
-        tok = tok.strip(".-")
-        if tok and tok not in _RECALL_STOPWORDS and tok not in seen:
-            tokens.append(tok)
-            seen.add(tok)
-
-    for part in raw_parts:
-        _add(part)
-        # Also add sub-parts of compound tokens
-        if "-" in part or "." in part:
-            for sub in re.split(r"[.-]", part):
-                _add(sub)
-
-    return tokens
-
-
-def _idf_score(
-    tokens: List[str],
-    all_haystacks: List[str],
-    n_docs: int,
-) -> Dict[str, float]:
-    """Return IDF weight per token: ``log(n_docs / df)``.
-
-    ``df`` is clamped to at least 1 so we never divide by zero.
-    """
-    weights: Dict[str, float] = {}
-    for tok in tokens:
-        df = sum(1 for h in all_haystacks if tok in h) or 1
-        weights[tok] = math.log(n_docs / df)
-    return weights
-
+#: Shared with the local web service; see ``rdn.notes.tokenize_query``.
+_tokenize_query = _notes.tokenize_query
+_idf_score = _notes.idf_score
 
 
 class RDNClient:
@@ -279,7 +229,7 @@ class RDNClient:
         self._background_flush_thread: Optional[threading.Thread] = None
         self._last_resolution: Optional[Dict[str, Any]] = None
 
-        # Node discovery priority:
+        # Node discovery priority (all skipped when REASON_RDN_NO_NODE=1):
         # 1. Explicit node_url param
         # 2. Network mode -> configure WARF Gateway plus Reason Registry while
         #    preserving the local node/storage path.
@@ -287,7 +237,14 @@ class RDNClient:
         # 4. ~/.reason-ecosystem.cfg
         # 5. Local port file
         # 6. Pure local
-        self.node_url: Optional[str] = node_url
+        self.node_lookup_disabled = node_lookup_disabled()
+        if self.node_lookup_disabled and node_url:
+            logger.warning(
+                "%s is set, so the node address %s is ignored and the local database is used.",
+                NO_NODE_ENV,
+                node_url,
+            )
+        self.node_url: Optional[str] = None if self.node_lookup_disabled else node_url
         self.broker_url: Optional[str] = None
         self.xport_url: Optional[str] = None
 
@@ -318,17 +275,21 @@ class RDNClient:
                     config.get("registry_url") or XPORT_URL
                 ).rstrip("/")
 
-        if not self.node_url:
+        if not self.node_url and not self.node_lookup_disabled:
             for key in ENV_NODE_KEYS:
                 val = os.environ.get(key)
                 if val:
                     self.node_url = val.rstrip("/")
                     break
 
-        if not self.node_url and configured_node != WARF_GATEWAY_URL:
+        if (
+            not self.node_url
+            and not self.node_lookup_disabled
+            and configured_node != WARF_GATEWAY_URL
+        ):
             self.node_url = configured_node or None
 
-        if not self.node_url:
+        if not self.node_url and not self.node_lookup_disabled:
             self.node_url = self._discover_local_node_via_port()
 
         # If we have explicit broker/xport in config later, they can override. For now single node_url is the main path.
@@ -351,6 +312,8 @@ class RDNClient:
     # ---------------- Discovery & Health ----------------
 
     def _discover_local_node_via_port(self) -> Optional[str]:
+        if node_lookup_disabled():
+            return None
         try:
             if PORT_FILE.exists():
                 port = int(PORT_FILE.read_text(encoding="utf-8").strip())
@@ -394,7 +357,10 @@ class RDNClient:
 
     def refresh_availability(self) -> bool:
         """Re-probe the node. Useful after starting a private node."""
-        if self.node_url:
+        if self.node_lookup_disabled:
+            self.node_url = None
+            self.available = False
+        elif self.node_url:
             self.available = self._check_health()
         else:
             # Try discovery again (node may have just started)
@@ -406,25 +372,10 @@ class RDNClient:
 
     def _ensure_local_schema(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS warf_artifacts (
-                    artifact_id TEXT PRIMARY KEY,
-                    address TEXT NOT NULL UNIQUE,
-                    domain TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    task TEXT NOT NULL,
-                    deposited_at TEXT NOT NULL,
-                    audit_hash TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_warf_domain_time ON warf_artifacts(domain, deposited_at DESC)"
-            )
+            # Saved notes, their forget/update columns, and the search index.
+            _notes.ensure_schema(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rdn_contribution_queue (
@@ -1685,12 +1636,25 @@ class RDNClient:
             "contributions": self.contribution_queue_status(),
         }
 
-    def list_prefix(self, prefix: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_prefix(
+        self,
+        prefix: str,
+        limit: int = 50,
+        *,
+        since: _notes.DayInput = None,
+        until: _notes.DayInput = None,
+        include_hidden: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         List artifacts whose address starts with the given prefix (e.g. 'reason://warf'
         or 'warf/build'). Works locally and against a node that supports /api/recall.
         Results are useful for browsing the reason:// namespace with partial URIs.
+
+        ``since`` and ``until`` (``YYYY-MM-DD``, both days included) keep only
+        items saved in that range. Forgotten and replaced notes are left out
+        unless ``include_hidden`` is true. A bad date raises ``ValueError``.
         """
+        _notes.day_bounds(since, until)  # reject bad dates before any lookup
         if not prefix:
             prefix = "reason://"
         if not prefix.startswith("reason://"):
@@ -1701,45 +1665,48 @@ class RDNClient:
         # Try remote node first (broad recall + client-side filter)
         if self.node_url and self.available:
             try:
-                results = self.recall(query="", limit=limit * 3)
+                results = self.recall(
+                    query="",
+                    limit=limit * 3,
+                    since=since,
+                    until=until,
+                    include_hidden=include_hidden,
+                )
                 matches = [r for r in results if (r.get("address") or "").startswith(prefix)]
                 return matches[:limit]
             except Exception:
                 pass
 
         # Local fallback
-        return self._list_prefix_local(prefix, limit)
+        return self._list_prefix_local(
+            prefix, limit, since=since, until=until, include_hidden=include_hidden
+        )
 
-    def _list_prefix_local(self, prefix: str, limit: int) -> List[Dict[str, Any]]:
+    def _list_prefix_local(
+        self,
+        prefix: str,
+        limit: int,
+        *,
+        since: _notes.DayInput = None,
+        until: _notes.DayInput = None,
+        include_hidden: bool = False,
+    ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
+        low, high = _notes.day_bounds(since, until)
         conn = self._get_conn()
         try:
-            conn.row_factory = sqlite3.Row
-            sql = """
-                SELECT address, domain, deposited_at, metadata_json 
-                FROM warf_artifacts 
-                WHERE address LIKE ? 
-                ORDER BY deposited_at DESC 
-                LIMIT ?
-            """
-            like = prefix + "%"
-            rows = conn.execute(sql, (like, limit * 2)).fetchall()
-
-            for row in rows:
-                try:
-                    meta = json.loads(row["metadata_json"])
-                except Exception:
-                    meta = {}
-                results.append({
-                    "address": row["address"],
-                    "project": row["domain"],
-                    "deposited_at": row["deposited_at"],
-                    "content": meta.get("content", ""),
-                    "tags": meta.get("tags", []),
-                    "artifact_hash": meta.get("artifact_hash") or meta.get("audit_hash"),
-                    "meta": meta,
-                    "source": "local",
-                })
+            for item in _notes.list_notes(
+                conn,
+                prefix,
+                limit=limit,
+                since=since,
+                until=until,
+                include_hidden=include_hidden,
+            ):
+                item["artifact_hash"] = item["meta"].get("artifact_hash") or item["meta"].get(
+                    "audit_hash"
+                )
+                results.append(item)
         except Exception as e:
             logger.error("Local list_prefix failed: %s", e)
         finally:
@@ -1747,6 +1714,8 @@ class RDNClient:
         try:
             seen = {item["address"] for item in results}
             for item in self._local_contributions(prefix, exact=False):
+                if not _notes.stamp_in_range(item["deposited_at"], low, high):
+                    continue
                 if item["address"] not in seen:
                     seen.add(item["address"])
                     results.append(item)
@@ -1865,19 +1834,44 @@ class RDNClient:
         tags: Optional[Iterable[str]] = None,
         project: Optional[str] = None,
         limit: int = 20,
+        *,
+        since: _notes.DayInput = None,
+        until: _notes.DayInput = None,
+        include_hidden: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Search artifacts. When node is healthy, query the node (broad recall) then
-        optionally post-filter by tags. Falls back to local DB with substring + tag filter.
+        Search every saved note (and local contributions) by words.
+
+        When a node is healthy, the node is asked; otherwise the local database
+        is searched. ``since`` and ``until`` (``YYYY-MM-DD``, both days
+        included, in this computer's time zone) limit results to notes saved
+        in that range. Forgotten and replaced notes are left out unless
+        ``include_hidden`` is true. A bad date raises ``ValueError``.
         """
         tags = list(tags) if tags else None
         limit = max(1, min(100, int(limit or 20)))
+        low, high = _notes.day_bounds(since, until)  # raises ValueError for bad dates
 
         if self.node_url and self.available:
-            params = {"query": query or "", "project": project or "", "limit": limit}
+            params: Dict[str, Any] = {
+                "query": query or "",
+                "project": project or "",
+                "limit": limit,
+            }
+            if since is not None:
+                params["since"] = _notes.parse_day(since, "since").isoformat()
+            if until is not None:
+                params["until"] = _notes.parse_day(until, "until").isoformat()
+            if include_hidden:
+                params["include_hidden"] = "1"
             node_res = self._http_get(f"{self.node_url}/api/recall", params=params)
             if node_res and node_res.get("status") == "ok":
                 results = node_res.get("results", []) or []
+                # An older node may not know the date filter; apply it here too.
+                results = [
+                    r for r in results
+                    if _notes.stamp_in_range(str(r.get("deposited_at") or ""), low, high)
+                ]
                 if tags:
                     results = [
                         r
@@ -1888,7 +1882,15 @@ class RDNClient:
                 return results[:limit]
 
         # Local fallback
-        return self._recall_local(query=query, tags=tags, project=project, limit=limit)
+        return self._recall_local(
+            query=query,
+            tags=tags,
+            project=project,
+            limit=limit,
+            since=since,
+            until=until,
+            include_hidden=include_hidden,
+        )
 
     def _recall_local(
         self,
@@ -1896,58 +1898,27 @@ class RDNClient:
         tags: Optional[List[str]],
         project: Optional[str],
         limit: int,
+        *,
+        since: _notes.DayInput = None,
+        until: _notes.DayInput = None,
+        include_hidden: bool = False,
     ) -> List[Dict[str, Any]]:
-        raw_query = (query or "").strip()
-        needle = raw_query.lower()
-
-        # Tokenize for OR-style matching; fall back to substring if all stopwords
-        tokens = _tokenize_query(raw_query) if raw_query else []
-        use_token_search = bool(tokens)
-
+        """Search the whole local database; see ``rdn.notes.search_notes``."""
+        low, high = _notes.day_bounds(since, until)
         conn = self._get_conn()
         try:
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts WHERE 1=1"
-            params: List[Any] = []
-
-            if project:
-                sql += " AND domain = ?"
-                params.append(project)
-
-            # Fetch a larger candidate set so scoring can re-rank across all rows
-            sql += " ORDER BY deposited_at DESC LIMIT ?"
-            params.append(limit * 10)
-
-            rows = conn.execute(sql, params).fetchall()
-
-            # Parse all rows up front so we can compute IDF across the candidate set
-            parsed: List[tuple] = []
-            all_haystacks: List[str] = []
-            for row in rows:
-                try:
-                    meta = json.loads(row["metadata_json"])
-                except Exception:
-                    continue
-                haystack = " ".join(
-                    [
-                        row["address"] or "",
-                        row["domain"] or "",
-                        row["deposited_at"] or "",
-                        json.dumps(meta, ensure_ascii=True),
-                    ]
-                ).lower()
-                parsed.append((row, meta, haystack))
-                all_haystacks.append(haystack)
-
             # Contributions saved on this machine are searchable too.
+            extra: List[tuple] = []
             try:
-                remembered = {row["address"] for row, _, _ in parsed}
                 for item in self._local_contributions("reason://", exact=False):
-                    if item["address"] in remembered:
-                        continue
                     if project and item.get("project") != project:
                         continue
-                    remembered.add(item["address"])
+                    if not _notes.stamp_in_range(item["deposited_at"], low, high):
+                        continue
+                    if any(item["address"] == e[3]["address"] for e in extra):
+                        continue
+                    if _notes.visible_address_exists(conn, item["address"]):
+                        continue
                     meta = dict(item["meta"])
                     meta.update({"content": item["content"], "tags": item["tags"]})
                     pseudo_row = {
@@ -1963,66 +1934,129 @@ class RDNClient:
                             json.dumps(meta, ensure_ascii=True),
                         ]
                     ).lower()
-                    parsed.append((pseudo_row, meta, haystack))
-                    all_haystacks.append(haystack)
+                    result = {
+                        "address": item["address"],
+                        "project": pseudo_row["domain"],
+                        "deposited_at": item["deposited_at"],
+                        "content": item["content"],
+                        "tags": item["tags"],
+                        "meta": meta,
+                        "source": "local",
+                    }
+                    extra.append((pseudo_row, meta, haystack, result))
             except Exception as e:
                 logger.error("Local contribution search failed: %s", e)
 
-            n_docs = len(parsed) or 1
-            idf = _idf_score(tokens, all_haystacks, n_docs) if use_token_search else {}
-
-            scored: List[tuple] = []
-            for row, meta, haystack in parsed:
-                if use_token_search:
-                    matched = [tok for tok in tokens if tok in haystack]
-                    if not matched:
-                        continue
-                    # Base score: sum of IDF weights for matched tokens
-                    score = sum(idf[tok] for tok in matched)
-                    # Bonus when the original phrase appears verbatim
-                    if needle and needle in haystack:
-                        score += 5.0
-                    # Smaller bonus for token hits inside the tags field
-                    tags_str = " ".join(meta.get("tags", []) or []).lower()
-                    score += 0.5 * sum(1 for tok in matched if tok in tags_str)
-                else:
-                    # All tokens were stopwords: fall back to substring match
-                    if needle and needle not in haystack:
-                        continue
-                    score = 0.0
-
-                if tags:
-                    entry_tags = meta.get("tags", []) or []
-                    if not any(t in entry_tags for t in tags) and not any(
-                        t in (row["address"] or "") for t in tags
-                    ):
-                        continue
-
-                scored.append(
-                    (
-                        score,
-                        {
-                            "address": row["address"],
-                            "project": row["domain"],
-                            "deposited_at": row["deposited_at"],
-                            "content": meta.get("content", ""),
-                            "tags": meta.get("tags", []),
-                            "meta": meta,
-                            "source": "local",
-                        },
-                    )
-                )
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-            results: List[Dict[str, Any]] = [item for _, item in scored[:limit]]
-
+            return _notes.search_notes(
+                conn,
+                query,
+                tags=tags,
+                project=project,
+                limit=limit,
+                since=since,
+                until=until,
+                include_hidden=include_hidden,
+                extra=extra,
+                source="local",
+            )
+        except ValueError:
+            raise
         except Exception as e:
             logger.error("Local recall failed: %s", e)
-            results = []
+            return []
         finally:
             conn.close()
 
-        return results
+    # ---------------- Forget and update ----------------
+
+    def _node_shares_database(self) -> bool:
+        """True when the running node writes to this client's own database file."""
+        info = self._http_get(f"{self.node_url}/api/health") if self.node_url else None
+        node_db = (info or {}).get("db_path")
+        if not node_db:
+            return False
+        try:
+            return Path(node_db).resolve() == self.db_path.resolve()
+        except OSError:
+            return False
+
+    def forget(self, note: str, *, purge: bool = False) -> Dict[str, Any]:
+        """Hide a saved note from recall and list, or delete it for good with ``purge``.
+
+        ``note`` is the note's id (or the first 6 or more characters of it)
+        or its reason:// address. Hidden notes stay in the database and can
+        still be purged. Raises ``rdn.notes.NoteLookupError`` when no single
+        note matches.
+        """
+        node_result: Optional[Dict[str, Any]] = None
+        if self.node_url and self.available:
+            node_result = self._http_post(
+                f"{self.node_url}/api/forget", {"note": note, "purge": bool(purge)}
+            )
+            if node_result and node_result.get("status") in {"forgotten", "purged"}:
+                if not self.mirror_local or self._node_shares_database():
+                    node_result.setdefault("source", "node")
+                    return node_result
+        local_ref = note
+        if node_result and node_result.get("status") in {"forgotten", "purged"}:
+            # Ids differ between the node and the local copy; addresses match.
+            local_ref = str(node_result.get("address") or note)
+        conn = self._get_conn()
+        try:
+            try:
+                result = _notes.forget_note(conn, local_ref, purge=purge)
+            except _notes.NoteLookupError:
+                if node_result and node_result.get("status") in {"forgotten", "purged"}:
+                    node_result.setdefault("source", "node")
+                    return node_result
+                raise
+        finally:
+            conn.close()
+        node_ok = bool(node_result and node_result.get("status") in {"forgotten", "purged"})
+        result["source"] = "node" if node_ok else "local"
+        return result
+
+    def update(
+        self,
+        note: str,
+        content: str,
+        *,
+        tags: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Save ``content`` as a new version of a note; the old version is hidden.
+
+        The old version is kept (``rdn forget <id> --purge`` removes it) and is
+        left out of recall and list. The new note keeps the old project, tags,
+        and extra details unless ``tags`` is given, and records the replaced
+        address in ``meta["supersedes"]``. Raises
+        ``rdn.notes.NoteLookupError`` when no single visible note matches.
+        """
+        tag_list = list(tags) if tags is not None else None
+        if self.node_url and self.available:
+            payload: Dict[str, Any] = {"note": note, "content": content}
+            if tag_list is not None:
+                payload["tags"] = tag_list
+            node_result = self._http_post(f"{self.node_url}/api/update", payload)
+            if node_result and node_result.get("status") in {"updated", "unchanged"}:
+                if self.mirror_local and not self._node_shares_database():
+                    conn = self._get_conn()
+                    # Ids differ between the node and the local copy; addresses match.
+                    local_ref = str(node_result.get("replaces") or node_result.get("address") or note)
+                    try:
+                        _notes.update_note(conn, local_ref, content, tags=tag_list)
+                    except (_notes.NoteLookupError, ValueError):
+                        pass
+                    finally:
+                        conn.close()
+                node_result.setdefault("source", "node")
+                return node_result
+        conn = self._get_conn()
+        try:
+            result = _notes.update_note(conn, note, content, tags=tag_list)
+        finally:
+            conn.close()
+        result["source"] = "local"
+        return result
 
     def resolve(
         self,
@@ -2075,7 +2109,8 @@ class RDNClient:
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts WHERE address = ?",
+                "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts "
+                "WHERE address = ? AND forgotten_at IS NULL",
                 (canonical_address,),
             ).fetchone()
             if not row:

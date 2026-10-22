@@ -199,9 +199,35 @@ class Reason:
             bypass_cache=bypass_cache,
         )
 
-    def recall(self, query: str = "", *, tags=None, project: Optional[str] = None, limit: int = 20):
+    def recall(
+        self,
+        query: str = "",
+        *,
+        tags=None,
+        project: Optional[str] = None,
+        limit: int = 20,
+        since=None,
+        until=None,
+        include_hidden: bool = False,
+    ):
         """Search saved notes by words (same as ``rdn recall``)."""
-        return self._client.recall(query=query, tags=tags, project=project, limit=limit)
+        return self._client.recall(
+            query=query,
+            tags=tags,
+            project=project,
+            limit=limit,
+            since=since,
+            until=until,
+            include_hidden=include_hidden,
+        )
+
+    def forget(self, note: str, *, purge: bool = False) -> Dict[str, Any]:
+        """Hide a saved note, or delete it for good with ``purge=True`` (``rdn forget``)."""
+        return self._client.forget(note, purge=purge)
+
+    def update(self, note: str, content: str, *, tags=None) -> Dict[str, Any]:
+        """Save a new version of a note; the old one is hidden but kept (``rdn update``)."""
+        return self._client.update(note, content, tags=tags)
 
     def contribute(self, content, *, reason_address: str, **kwargs):
         """Queue a reusable artifact in the configured Reason scope."""
@@ -227,9 +253,19 @@ class Reason:
     def xchange_arbitrate(self, query_text: str, packages: List[Dict[str, Any]], **kwargs):
         return self.network_arbitrate(query_text, packages, **kwargs)
 
-    def list_prefix(self, prefix: str, limit: int = 20):
+    def list_prefix(
+        self,
+        prefix: str,
+        limit: int = 20,
+        *,
+        since=None,
+        until=None,
+        include_hidden: bool = False,
+    ):
         """List artifacts under a reason:// prefix (great for browsing with partial URIs)."""
-        return self._client.list_prefix(prefix, limit=limit)
+        return self._client.list_prefix(
+            prefix, limit=limit, since=since, until=until, include_hidden=include_hidden
+        )
 
     @property
     def status(self):
@@ -338,19 +374,75 @@ def resolve(
     return res
 
 
-def recall(query: str = "", *, tags=None, project: Optional[str] = None, limit: int = 20):
-    """Search saved notes by words, newest and best matches first.
+def recall(
+    query: str = "",
+    *,
+    tags=None,
+    project: Optional[str] = None,
+    limit: int = 20,
+    since=None,
+    until=None,
+    include_hidden: bool = False,
+):
+    """Search every saved note by words, best matches first (newest first on ties).
+
+    ``since`` and ``until`` take a date written as ``YYYY-MM-DD`` (or a
+    ``datetime.date``) and keep only notes saved on those days or between
+    them, in this computer's time zone. A badly written date raises
+    ``ValueError``. Forgotten and replaced notes are left out unless
+    ``include_hidden=True``.
 
     Example::
 
         import rdn
         rdn.remember("Fixed the deployment race", tags=["infra"])
-        for hit in rdn.recall("deployment race"):
-            print(hit["address"], hit["content"])
+        for hit in rdn.recall("deployment race", since="2026-10-01"):
+            print(hit["id"], hit["content"])
     """
-    results = _get_default().recall(query, tags=tags, project=project, limit=limit)
+    results = _get_default().recall(
+        query,
+        tags=tags,
+        project=project,
+        limit=limit,
+        since=since,
+        until=until,
+        include_hidden=include_hidden,
+    )
     _harness_metrics.record_recall(str(query))
     return results
+
+
+def forget(note: str, *, purge: bool = False) -> Dict[str, Any]:
+    """Hide a saved note from recall and list, or delete it for good.
+
+    ``note`` is the id that ``remember`` and ``recall`` print (the first 6 or
+    more characters are enough) or the note's reason:// address. Without
+    ``purge`` the note is only hidden. With ``purge=True`` it is deleted from
+    the database. Raises ``rdn.NoteLookupError`` when no single note matches.
+
+    Example::
+
+        saved = rdn.remember("Old phone number is 555-0100")
+        rdn.forget(saved["artifact_id"])
+    """
+    return _get_default().forget(note, purge=purge)
+
+
+def update(note: str, content: str, *, tags=None) -> Dict[str, Any]:
+    """Save ``content`` as a new version of a note.
+
+    The old version is hidden from recall and list but kept in the database,
+    so ``rdn.forget(old_id, purge=True)`` can still delete it. The new note
+    keeps the old project and tags (unless ``tags`` is given) and its
+    ``meta["supersedes"]`` names the address it replaces. Raises
+    ``rdn.NoteLookupError`` when no single visible note matches.
+
+    Example::
+
+        saved = rdn.remember("Deploys happen on Tuesdays")
+        rdn.update(saved["artifact_id"], "Deploys happen on Thursdays")
+    """
+    return _get_default().update(note, content, tags=tags)
 
 
 def contribute(content, *, reason_address: str, **kwargs):
@@ -398,12 +490,15 @@ def harness_metrics():
     return _harness_metrics.summary()
 
 
-def list_prefix(prefix: str, limit: int = 20):
+def list_prefix(prefix: str, limit: int = 20, *, since=None, until=None, include_hidden: bool = False):
     """List artifacts currently registered under a reason:// prefix.
     Example: list_prefix("reason://warf") or list_prefix("warf") returns
     all known URIs starting with that prefix. Useful for autocomplete / browsing.
+    ``since`` and ``until`` work as in ``recall``.
     """
-    return _get_default().list_prefix(prefix, limit=limit)
+    return _get_default().list_prefix(
+        prefix, limit=limit, since=since, until=until, include_hidden=include_hidden
+    )
 
 
 # Recent URIs for quick access / persistence across sessions

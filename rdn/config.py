@@ -15,6 +15,12 @@ HOME_ENV = "REASON_RDN_HOME"
 #: Environment variable that points at an alternate JSON config file.
 CONFIG_ENV = "REASON_RDN_CONFIG"
 
+#: Environment variable that turns off every way of finding a local web
+#: service (node): ``--node``, the node URL variables, ``node_url`` in the
+#: config file, and the port file. Reads and writes then always go straight
+#: to the database file in the data folder.
+NO_NODE_ENV = "REASON_RDN_NO_NODE"
+
 
 def env_flag(*names: str) -> bool:
     """Return true when any named environment variable explicitly enables a flag."""
@@ -45,3 +51,8 @@ def config_file() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / ".reason-ecosystem.cfg"
+
+
+def node_lookup_disabled() -> bool:
+    """True when ``REASON_RDN_NO_NODE`` is set to 1, true, yes, or on."""
+    return env_flag(NO_NODE_ENV)

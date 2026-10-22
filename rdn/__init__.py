@@ -8,6 +8,8 @@ unless you choose to share it with a team server or the public registry.
     import rdn
     rdn.remember("Fixed the deployment race", tags=["infra"])
     hits = rdn.recall("deployment race")
+    newer = rdn.update(hits[0]["id"], "Fixed the deployment race with a lock")
+    rdn.forget(newer["id"])            # hide it; add purge=True to delete it
 
     rdn.contribute("Pause writes, restore, verify.", reason_address="reason://ops/deployment/rollback-plan")
     answer = rdn.resolve("reason://ops/deployment/rollback-plan")
@@ -15,7 +17,7 @@ unless you choose to share it with a team server or the public registry.
 
 from __future__ import annotations
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 from .artifact import (
     CANONICAL_ARTIFACT_FIELDS,
@@ -54,6 +56,7 @@ from .contribution import (
     parse_contribution_envelope,
     parse_contribution_receipt,
 )
+from .notes import NoteLookupError
 from .doclang_adapter import (
     DOCLANG_MEDIA_TYPE,
     DocLangAdapterError,
@@ -92,6 +95,7 @@ from .reason import (
     add_recent_uri,
     admit,
     contribute,
+    forget,
     get_recent_uris,
     harness_metrics,
     list_prefix,
@@ -102,6 +106,7 @@ from .reason import (
     remember,  # module-level simplest API
     resolve,
     status,
+    update,
 )
 from .reason import (
     xchange_arbitrate as xchange_arbitrate,
@@ -139,6 +144,9 @@ __all__ = [
     "Reason",
     "remember",
     "recall",
+    "forget",
+    "update",
+    "NoteLookupError",
     "resolve",
     "list_prefix",
     "add_recent_uri",

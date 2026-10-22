@@ -6,6 +6,9 @@ Works the same for people and for agents that can run shell commands.
 Examples:
     rdn remember "Fixed the deployment race" --tags infra,deploy
     rdn recall "deployment race"
+    rdn recall "deployment" --since 2026-10-01 --until 2026-10-31
+    rdn update 3f9a1c "Fixed the deployment race with a lock"
+    rdn forget 3f9a1c
     rdn contribute "Pause writes, restore, verify, then switch traffic." --uri reason://ops/deployment/rollback-plan
     rdn resolve reason://ops/deployment/rollback-plan
     rdn status
@@ -23,7 +26,8 @@ from typing import Optional
 from rdn import __version__
 from rdn.artifact import PROTOCOL_LOCK_DIGEST, PROTOCOL_LOCK_ID
 from rdn.client import REASON_REGISTRY_URL, WARF_GATEWAY_URL, RDNClient
-from rdn.config import env_flag
+from rdn.config import NO_NODE_ENV, env_flag
+from rdn.notes import NoteLookupError, parse_day
 from rdn.doclang_adapter import prepare_doclang_contribution
 from rdn.handoff import ReasonRDN
 
@@ -39,6 +43,21 @@ _NETWORK_ENV_KEYS = (
 def _note(message: str) -> None:
     """Print a plain-language hint for people without disturbing JSON on stdout."""
     print(f"Note: {message}", file=sys.stderr)
+
+
+def _fail(message: str, code: int = 1) -> None:
+    """Print a plain-language error and stop."""
+    print(f"rdn: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _day_arg(value: str) -> str:
+    """argparse type for --since and --until: a date written as YYYY-MM-DD."""
+    try:
+        parse_day(value, "date")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
 
 
 def _resolve_node_url(args) -> Optional[str]:
@@ -95,11 +114,17 @@ def cmd_remember(args):
 def cmd_recall(args):
     node_url = _resolve_node_url(args)
     client = RDNClient(node_url=node_url)
-    results = client.recall(
-        query=args.query,
-        project=args.project,
-        limit=args.limit,
-    )
+    try:
+        results = client.recall(
+            query=args.query,
+            project=args.project,
+            limit=args.limit,
+            since=args.since,
+            until=args.until,
+            include_hidden=bool(args.include_hidden),
+        )
+    except ValueError as exc:
+        _fail(str(exc), 2)
     # Real token accounting for recalls (savings when an agent uses prior high-quality artifact).
     tokens_saved = getattr(args, "tokens_saved", None) or os.environ.get("RDN_TOKENS_SAVED")
     if tokens_saved:
@@ -142,11 +167,53 @@ def cmd_resolve(args):
             pass
 
 
+def cmd_forget(args):
+    client = RDNClient(node_url=_resolve_node_url(args))
+    try:
+        result = client.forget(args.note, purge=bool(args.purge))
+    except NoteLookupError as exc:
+        _fail(str(exc.args[0]))
+    print(json.dumps(result, indent=2))
+
+
+def cmd_update(args):
+    client = RDNClient(node_url=_resolve_node_url(args))
+    tags = None
+    if args.tags is not None:
+        tags = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+    try:
+        result = client.update(args.note, args.content, tags=tags)
+    except NoteLookupError as exc:
+        _fail(str(exc.args[0]))
+    except ValueError as exc:
+        _fail(str(exc), 2)
+    print(json.dumps(result, indent=2))
+
+
+def _shared_layer_line(default_scope: str, endpoint: Optional[str]) -> str:
+    """Describe the shared layer without implying that it is being contacted."""
+    if not endpoint:
+        return "not configured"
+    if default_scope == "shared":
+        return (
+            f"{endpoint} (selected as the default scope: contacted by "
+            "'resolve --source chain' and shared contributions)"
+        )
+    return (
+        f"{endpoint} (not contacted unless you choose it with --scope shared "
+        "or --source registry)"
+    )
+
+
 def cmd_status(args):
     node_url = _resolve_node_url(args)
     client = RDNClient(node_url=node_url)
     print("ReasonRDN status")
-    print("  Node URL :", client.node_url or "local fallback only")
+    if client.node_lookup_disabled:
+        node_line = f"turned off by {NO_NODE_ENV}; using the local database file only"
+    else:
+        node_line = client.node_url or "none found; using the local database file"
+    print("  Node URL :", node_line)
     network_enabled = _network_enabled(args, client)
     print("  Network  :", "selected" if network_enabled else "local only")
     print(
@@ -167,7 +234,12 @@ def cmd_status(args):
         "  Org      :",
         resolvers["layers"]["organization"]["endpoint"] or "not configured",
     )
-    print("  Shared   :", resolvers["layers"]["shared"]["endpoint"])
+    print(
+        "  Shared   :",
+        _shared_layer_line(
+            resolvers["default_scope"], resolvers["layers"]["shared"]["endpoint"]
+        ),
+    )
     print(
         "  Queue    :",
         f"{queue['ready']} ready, {queue['states'].get('delivered', 0)} delivered, "
@@ -316,7 +388,16 @@ def cmd_admit(args):
 def cmd_list(args):
     node_url = _resolve_node_url(args)
     client = RDNClient(node_url=node_url)
-    results = client.list_prefix(args.prefix, limit=args.limit)
+    try:
+        results = client.list_prefix(
+            args.prefix,
+            limit=args.limit,
+            since=args.since,
+            until=args.until,
+            include_hidden=bool(args.include_hidden),
+        )
+    except ValueError as exc:
+        _fail(str(exc), 2)
     print(json.dumps({"results": results}, indent=2))
 
 
@@ -325,7 +406,7 @@ def main():
         prog="rdn",
         description=(
             "ReasonRDN: a local memory for AI agents. Save notes with 'remember', find them "
-            "with 'recall', and keep reusable answers at a fixed reason:// address with "
+            "with 'recall', fix or remove them with 'update' and 'forget', and keep reusable answers at a fixed reason:// address with "
             "'contribute' and 'resolve'. Everything stays on this computer unless you choose to share."
         )
     )
@@ -334,7 +415,12 @@ def main():
         action="version",
         version=f"rdn {__version__}",
     )
-    parser.add_argument("--node", default=None, help="Override node URL (default: auto-discover local private node)")
+    parser.add_argument(
+        "--node",
+        default=None,
+        help="Use the local web service at this address (default: find it automatically). "
+             f"Ignored when {NO_NODE_ENV}=1.",
+    )
     parser.add_argument(
         "--network", "--use-network", "--xchange", "--use-xchange",
         dest="xchange", action="store_true",
@@ -349,7 +435,7 @@ def main():
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_rem = sub.add_parser("remember", help="Deposit a handoff / memory")
+    p_rem = sub.add_parser("remember", help="Save a note (prints its address and id)")
     p_rem.add_argument("content", help="The summary or content to remember")
     p_rem.add_argument("--project", default="astrognosy")
     p_rem.add_argument("--tags", default=None, help="Comma-separated tags")
@@ -358,10 +444,16 @@ def main():
                        help="Tokens consumed to produce this handoff (for accurate harness metrics / token savings tracking)")
     p_rem.set_defaults(func=cmd_remember)
 
-    p_rec = sub.add_parser("recall", help="Search memory")
-    p_rec.add_argument("query", help="Search query")
+    p_rec = sub.add_parser(
+        "recall",
+        help="Search every saved note by words",
+        description="Search every saved note by words. Best matches come first, newest first on ties. "
+                    "Forgotten notes and old versions replaced by 'update' are left out.",
+    )
+    p_rec.add_argument("query", nargs="?", default="", help="Words to look for (leave out to list the newest notes)")
     p_rec.add_argument("--project", default=None)
-    p_rec.add_argument("--limit", type=int, default=10)
+    p_rec.add_argument("--limit", type=int, default=10, help="Most results to show (default 10, at most 100)")
+    _add_date_args(p_rec)
     p_rec.add_argument("--tokens-saved", type=int, default=None, dest="tokens_saved",
                        help="Tokens saved by using this recall (for accurate harness metrics)")
     p_rec.set_defaults(func=cmd_recall)
@@ -386,7 +478,43 @@ def main():
                        help="Tokens saved by resolving and using this artifact (for accurate harness metrics)")
     p_res.set_defaults(func=cmd_resolve)
 
-    p_stat = sub.add_parser("status", help="Show current node/client status + heartbeat")
+    p_forget = sub.add_parser(
+        "forget",
+        help="Hide a saved note, or delete it for good with --purge",
+        description="Hide a saved note so recall and list no longer show it. The note stays in the "
+                    "database until you add --purge, which deletes it for good. Saving the exact same "
+                    "text again with remember brings a hidden note back.",
+    )
+    p_forget.add_argument(
+        "note",
+        help="The note's id (the first 6 or more characters are enough) or its reason:// address",
+    )
+    p_forget.add_argument("--purge", action="store_true", help="Delete the note from the database for good")
+    p_forget.set_defaults(func=cmd_forget)
+
+    p_update = sub.add_parser(
+        "update",
+        help="Replace a saved note with new text",
+        description="Save new text as a new version of a note. The old version is hidden from recall "
+                    "and list but kept in the database (use 'rdn forget <old id> --purge' to delete it). "
+                    "The new note keeps the old project and tags, and its meta.supersedes names the "
+                    "address it replaces.",
+    )
+    p_update.add_argument(
+        "note",
+        help="The note's id (the first 6 or more characters are enough) or its reason:// address",
+    )
+    p_update.add_argument("content", help="The new text")
+    p_update.add_argument("--tags", default=None, help="Comma-separated tags for the new version (default: keep the old tags)")
+    p_update.set_defaults(func=cmd_update)
+
+    p_stat = sub.add_parser(
+        "status",
+        help="Show where notes are stored and which services are selected",
+        description="Show where notes are stored and which services are selected. This command only "
+                    "checks a local web service if one is set up; it never contacts the shared "
+                    "Reason Registry or the WARF Gateway.",
+    )
     p_stat.set_defaults(func=cmd_status)
 
     p_contribute = sub.add_parser(
@@ -486,6 +614,7 @@ def main():
     p_list = sub.add_parser("list", help="List artifacts under a reason:// prefix (browse the namespace with partial URIs)")
     p_list.add_argument("prefix", help="e.g. reason://grok or grok/build or warf")
     p_list.add_argument("--limit", type=int, default=20, help="Max results to show")
+    _add_date_args(p_list)
     p_list.set_defaults(func=cmd_list)
 
     # One-liner experience
@@ -508,6 +637,28 @@ def main():
 
     args = parser.parse_args()
     args.func(args)
+
+
+def _add_date_args(subparser) -> None:
+    subparser.add_argument(
+        "--since",
+        type=_day_arg,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Only notes saved on this day or later (your computer's time zone)",
+    )
+    subparser.add_argument(
+        "--until",
+        type=_day_arg,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Only notes saved on this day or earlier (your computer's time zone)",
+    )
+    subparser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Also show forgotten notes and old versions replaced by update",
+    )
 
 
 def launch_harness(args=None):

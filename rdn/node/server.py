@@ -6,9 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
-import math
 import os
-import re
 import sqlite3
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -16,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from .. import notes as _notes
 from ..addressing import project_address as _project_address
 from ..config import data_dir
 
@@ -47,26 +46,10 @@ def ensure_schema(db_path: str) -> None:
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS warf_artifacts (
-                artifact_id TEXT PRIMARY KEY,
-                address TEXT NOT NULL UNIQUE,
-                domain TEXT NOT NULL,
-                category TEXT NOT NULL,
-                task TEXT NOT NULL,
-                deposited_at TEXT NOT NULL,
-                audit_hash TEXT NOT NULL,
-                metadata_json TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_warf_domain_time ON warf_artifacts(domain, deposited_at DESC)"
-        )
-        conn.commit()
+        # Same tables, upgrades, and search index as the client (rdn.notes).
+        _notes.ensure_schema(conn)
     finally:
         conn.close()
 
@@ -75,47 +58,10 @@ def _hash_payload(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Tokenized recall helpers (mirrors rdn.client, no shared import to keep the
-# node self-contained)
-# ---------------------------------------------------------------------------
-
-_RECALL_STOPWORDS: frozenset = frozenset({
-    "what", "who", "how", "why", "when", "where", "which",
-    "does", "do", "did", "is", "are", "should", "could", "would", "can",
-    "i", "me", "my", "the", "a", "an", "of", "for", "to", "in", "on",
-    "and", "or",
-})
-
-
-def _tokenize_query(query: str) -> List[str]:
-    """Tokenize a recall query, preserving compound tokens like ISSUE-025."""
-    raw_parts = re.split(r"[^\w.\-]+", query.lower())
-    tokens: List[str] = []
-    seen: set = set()
-
-    def _add(tok: str) -> None:
-        tok = tok.strip(".-")
-        if tok and tok not in _RECALL_STOPWORDS and tok not in seen:
-            tokens.append(tok)
-            seen.add(tok)
-
-    for part in raw_parts:
-        _add(part)
-        if "-" in part or "." in part:
-            for sub in re.split(r"[.-]", part):
-                _add(sub)
-
-    return tokens
-
-
-def _idf_score(tokens: List[str], all_haystacks: List[str], n_docs: int) -> Dict[str, float]:
-    weights: Dict[str, float] = {}
-    for tok in tokens:
-        df = sum(1 for h in all_haystacks if tok in h) or 1
-        weights[tok] = math.log(n_docs / df)
-    return weights
-
+# Search helpers are shared with rdn.client through rdn.notes.
+_RECALL_STOPWORDS: frozenset = _notes.RECALL_STOPWORDS
+_tokenize_query = _notes.tokenize_query
+_idf_score = _notes.idf_score
 
 
 class PrivateWARFNodeServer(ThreadingHTTPServer):
@@ -196,8 +142,24 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
                 limit = max(1, min(100, int(limit_raw)))
             except ValueError:
                 limit = 20
+            since = (params.get("since", [""])[0] or "").strip() or None
+            until = (params.get("until", [""])[0] or "").strip() or None
+            include_hidden = (params.get("include_hidden", [""])[0] or "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
 
-            results = self._recall(query=query, project=project, limit=limit)
+            try:
+                results = self._recall(
+                    query=query,
+                    project=project,
+                    limit=limit,
+                    since=since,
+                    until=until,
+                    include_hidden=include_hidden,
+                )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
+                return
             self._send_json(HTTPStatus.OK, {"status": "ok", "results": results})
             return
 
@@ -223,7 +185,7 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/api/remember":
+        if parsed.path not in {"/api/remember", "/api/forget", "/api/update"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"status": "error", "message": "Unknown endpoint"})
             return
 
@@ -234,6 +196,10 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
+            return
+
+        if parsed.path in {"/api/forget", "/api/update"}:
+            self._change_note(parsed.path, payload)
             return
 
         content = str(payload.get("content", "")).strip()
@@ -299,92 +265,66 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _fetch_rows(self, project: Optional[str], limit: int) -> List[sqlite3.Row]:
-        conn = sqlite3.connect(self._db_path)
+    def _change_note(self, path: str, payload: Dict[str, Any]) -> None:
+        """Handle POST /api/forget and POST /api/update."""
+        note = str(payload.get("note") or payload.get("id") or payload.get("address") or "").strip()
+        conn = sqlite3.connect(self._db_path, timeout=30.0)
         try:
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts WHERE 1=1"
-            params: List[Any] = []
-            if project:
-                sql += " AND domain = ?"
-                params.append(project)
-            sql += " ORDER BY deposited_at DESC LIMIT ?"
-            params.append(max(1, limit) * 5)
-            return conn.execute(sql, params).fetchall()
+            if path == "/api/forget":
+                result = _notes.forget_note(conn, note, purge=bool(payload.get("purge")))
+            else:
+                tags = payload.get("tags")
+                if tags is not None and not isinstance(tags, list):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST, {"status": "error", "message": "tags must be a list"}
+                    )
+                    return
+                result = _notes.update_note(
+                    conn, note, str(payload.get("content") or ""), tags=tags
+                )
+        except _notes.NoteLookupError as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, {"status": "error", "message": str(exc.args[0])})
+            return
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"status": "error", "message": str(exc)})
+            return
         finally:
             conn.close()
+        result["source"] = "node"
+        self._send_json(HTTPStatus.OK, result)
 
-    def _recall(self, query: str, project: Optional[str], limit: int) -> List[Dict[str, Any]]:
-        raw_query = query.strip()
-        needle = raw_query.lower()
-
-        tokens = _tokenize_query(raw_query) if raw_query else []
-        use_token_search = bool(tokens)
-
-        # Fetch a larger candidate set so we can score and re-rank
-        candidate_rows = self._fetch_rows(project, limit * 10)
-
-        parsed: List[tuple] = []
-        all_haystacks: List[str] = []
-        for row in candidate_rows:
-            try:
-                meta = json.loads(row["metadata_json"])
-            except json.JSONDecodeError:
-                continue
-            haystack = " ".join(
-                [
-                    row["address"],
-                    row["domain"],
-                    row["deposited_at"],
-                    json.dumps(meta, ensure_ascii=True),
-                ]
-            ).lower()
-            parsed.append((row, meta, haystack))
-            all_haystacks.append(haystack)
-
-        n_docs = len(parsed) or 1
-        idf = _idf_score(tokens, all_haystacks, n_docs) if use_token_search else {}
-
-        scored: List[tuple] = []
-        for row, meta, haystack in parsed:
-            if use_token_search:
-                matched = [tok for tok in tokens if tok in haystack]
-                if not matched:
-                    continue
-                score = sum(idf[tok] for tok in matched)
-                if needle and needle in haystack:
-                    score += 5.0
-                tags_str = " ".join(meta.get("tags", []) or []).lower()
-                score += 0.5 * sum(1 for tok in matched if tok in tags_str)
-            else:
-                if needle and needle not in haystack:
-                    continue
-                score = 0.0
-
-            scored.append(
-                (
-                    score,
-                    {
-                        "address": row["address"],
-                        "project": row["domain"],
-                        "deposited_at": row["deposited_at"],
-                        "content": meta.get("content", ""),
-                        "tags": meta.get("tags", []),
-                        "meta": meta,
-                        "source": "node",
-                    },
-                )
+    def _recall(
+        self,
+        query: str,
+        project: Optional[str],
+        limit: int,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        include_hidden: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Search every saved note; raises ValueError for a bad date."""
+        conn = sqlite3.connect(self._db_path, timeout=30.0)
+        try:
+            return _notes.search_notes(
+                conn,
+                query,
+                project=project,
+                limit=limit,
+                since=since,
+                until=until,
+                include_hidden=include_hidden,
+                source="node",
             )
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [item for _, item in scored[:limit]]
+        finally:
+            conn.close()
 
     def _resolve(self, address: str) -> Optional[Dict[str, Any]]:
         conn = sqlite3.connect(self._db_path)
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts WHERE address = ?",
+                "SELECT address, domain, deposited_at, metadata_json FROM warf_artifacts "
+                "WHERE address = ? AND forgotten_at IS NULL",
                 (address,),
             ).fetchone()
             if row is None:
