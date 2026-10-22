@@ -104,9 +104,7 @@ print(artifact.content)
 
 Addresses have exactly three lowercase parts: `reason://team/topic/task`.
 
-This works fully offline in ReasonRDN 0.6.2 and newer. Until 0.6.2 is on PyPI,
-install the newest code with
-`pip install "git+https://github.com/Astrognosy-Ai/ReasonRDN.git@public"`.
+This works fully offline in ReasonRDN 0.6.2 and newer.
 
 ## Sharing with a team (optional)
 
