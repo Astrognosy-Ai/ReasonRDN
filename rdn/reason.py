@@ -34,15 +34,21 @@ from typing import Any, Dict, List, Optional
 
 from .artifact import ReasonArtifact
 from .client import REASON_REGISTRY_URL, WARF_GATEWAY_URL, RDNClient
-from .config import env_flag
+from .config import data_dir, env_flag
 
 # Simple persistent metrics for the agnostic harness
-METRICS_FILE = Path.home() / ".reason-rdn" / "harness_metrics.json"
+METRICS_FILE = data_dir() / "harness_metrics.json"
 
 class HarnessMetrics:
-    """Lightweight, local-first metrics tracker for the reason harness.
-    Tracks token savings estimates, velocity, ship rate, and positive signals.
-    Agnostic to specific agents/models - works across the stack.
+    """Small local counters for how ReasonRDN is being used.
+
+    Every number here is counted, never guessed:
+
+    - ``total_handoffs``: notes saved through the Python API, CLI, or dashboard.
+    - ``total_recalls``: lookups made through the Python API, CLI, or dashboard.
+    - ``estimated_tokens_saved``: the sum of ``tokens_saved`` values that agents
+      reported themselves. It stays at 0 until something reports a number.
+    - ``vibe_stars``: notes tagged ``positive`` plus explicit shares.
     """
     def __init__(self):
         self.path = METRICS_FILE
@@ -50,22 +56,26 @@ class HarnessMetrics:
         self.data = self._load()
 
     def _load(self) -> Dict:
-        if self.path.exists():
-            try:
-                return json.loads(self.path.read_text())
-            except Exception:
-                pass
-        return {
+        defaults = {
             "total_handoffs": 0,
             "total_recalls": 0,
-            "estimated_tokens_saved": 0,  # rough: each recall vs full re-reason ~1500-4000 tokens
+            "estimated_tokens_saved": 0,  # only tokens_saved values reported by callers
             "sessions": 0,
             "vibe_stars": 0,
             "last_activity": None,
             "workflow_suggestions": [],
         }
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text())
+                if isinstance(loaded, dict):
+                    defaults.update(loaded)
+            except Exception:
+                pass
+        return defaults
 
     def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2))
 
     def record_handoff(self, content: str, tags: List[str] = None, tokens_used: int = None):
@@ -74,7 +84,7 @@ class HarnessMetrics:
         if tags and "positive" in [t.lower() for t in tags]:
             self.data["vibe_stars"] += 1
         if tokens_used:
-            # Record the cost of creating this high-quality artifact
+            # Record the cost of creating this artifact, as reported by the caller.
             self.data.setdefault("tokens_invested", 0)
             self.data["tokens_invested"] += tokens_used
         self._save()
@@ -82,10 +92,8 @@ class HarnessMetrics:
     def record_recall(self, query: str, tokens_saved: int = None):
         self.data["total_recalls"] += 1
         if tokens_saved:
+            # Only count savings the caller actually reported. No guessed defaults.
             self.data["estimated_tokens_saved"] += tokens_saved
-        else:
-            # Fallback rough estimate only when agents don't report real numbers
-            self.data["estimated_tokens_saved"] += 2200
         self.data["last_activity"] = datetime.now(timezone.utc).isoformat()
         self._save()
 
@@ -93,27 +101,14 @@ class HarnessMetrics:
         self.data["vibe_stars"] += 2
         self._save()
 
-    def get_velocity(self) -> float:
-        """Handoffs per active day (very approximate)."""
-        if not self.data["last_activity"]:
-            return 0.0
-        # simplistic
-        return round(self.data["total_handoffs"] / max(1, (self.data["total_recalls"] or 1) / 5), 1)
-
-    def get_ship_rate(self) -> float:
-        """% of handoffs that led to recalls (proxy for usefulness)."""
-        if self.data["total_handoffs"] == 0:
-            return 0.0
-        return round((self.data["total_recalls"] / self.data["total_handoffs"]) * 100, 1)
-
     def get_suggestions(self) -> List[str]:
         suggestions = []
         if self.data["total_recalls"] > 5 and self.data["estimated_tokens_saved"] > 10000:
-            suggestions.append("High recall rate - you are benefiting from prior artifacts. Give reusable work a precise reason:// address and contribute it within the configured scope.")
+            suggestions.append("You are reusing earlier work often. Give your most reused answers a fixed reason:// address so every agent finds them first.")
         if self.data["vibe_stars"] > 3:
-            suggestions.append("Strong positive signal. Contribute the reusable result, or call WARF separately when competing candidates need arbitration.")
-        if self.get_ship_rate() < 20:
-            suggestions.append("Ship rate low - add clearer project, tags, and state_tokens in handoffs to improve local recall precision.")
+            suggestions.append("Several notes are marked positive. Consider contributing the reusable ones so the next agent starts from them.")
+        if self.data["total_handoffs"] >= 5 and self.data["total_recalls"] == 0:
+            suggestions.append("You have saved notes but not looked any up yet. Try rdn recall \"<topic>\" before starting new work.")
         self.data["workflow_suggestions"] = suggestions[:3]
         self._save()
         return self.data["workflow_suggestions"]
@@ -121,10 +116,10 @@ class HarnessMetrics:
     def summary(self) -> Dict:
         return {
             "estimated_tokens_saved": self.data["estimated_tokens_saved"],
-            "velocity": self.get_velocity(),
-            "ship_rate": self.get_ship_rate(),
+            "tokens_saved_is_reported": True,
             "vibe_stars": self.data["vibe_stars"],
             "total_handoffs": self.data["total_handoffs"],
+            "total_recalls": self.data["total_recalls"],
             "suggestions": self.get_suggestions(),
         }
 
@@ -203,6 +198,10 @@ class Reason:
             version=version,
             bypass_cache=bypass_cache,
         )
+
+    def recall(self, query: str = "", *, tags=None, project: Optional[str] = None, limit: int = 20):
+        """Search saved notes by words (same as ``rdn recall``)."""
+        return self._client.recall(query=query, tags=tags, project=project, limit=limit)
 
     def contribute(self, content, *, reason_address: str, **kwargs):
         """Queue a reusable artifact in the configured Reason scope."""
@@ -339,6 +338,21 @@ def resolve(
     return res
 
 
+def recall(query: str = "", *, tags=None, project: Optional[str] = None, limit: int = 20):
+    """Search saved notes by words, newest and best matches first.
+
+    Example::
+
+        import rdn
+        rdn.remember("Fixed the deployment race", tags=["infra"])
+        for hit in rdn.recall("deployment race"):
+            print(hit["address"], hit["content"])
+    """
+    results = _get_default().recall(query, tags=tags, project=project, limit=limit)
+    _harness_metrics.record_recall(str(query))
+    return results
+
+
 def contribute(content, *, reason_address: str, **kwargs):
     """Durably queue a reusable artifact for local, organization, or shared scope."""
     return _get_default().contribute(
@@ -380,7 +394,7 @@ def status():
     return base
 
 def harness_metrics():
-    """Direct access to the agnostic harness metrics (tokens, velocity, suggestions, etc)."""
+    """Local usage counters: notes saved, lookups, and reported token savings."""
     return _harness_metrics.summary()
 
 
@@ -393,7 +407,7 @@ def list_prefix(prefix: str, limit: int = 20):
 
 
 # Recent URIs for quick access / persistence across sessions
-RECENT_URIS_FILE = Path.home() / ".reason-rdn" / "recent_uris.json"
+RECENT_URIS_FILE = data_dir() / "recent_uris.json"
 
 def _load_recent_uris():
     if RECENT_URIS_FILE.exists():

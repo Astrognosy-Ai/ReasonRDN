@@ -1,12 +1,13 @@
 """
-rdn — friendly CLI for the ReasonRDN memory substrate.
+rdn - command line for ReasonRDN, a local memory for AI agents.
 
-Designed to be useful both for humans and for agents that can shell out.
+Works the same for people and for agents that can run shell commands.
 
 Examples:
-    rdn remember "Fixed the critical race in the handoff protocol" --tags infra,bugfix
-    rdn recall "race condition" --project ReasonRDN --limit 5
-    rdn resolve reason://ReasonRDN/handoff/abc12345
+    rdn remember "Fixed the deployment race" --tags infra,deploy
+    rdn recall "deployment race"
+    rdn contribute "Pause writes, restore, verify, then switch traffic." --uri reason://ops/deployment/rollback-plan
+    rdn resolve reason://ops/deployment/rollback-plan
     rdn status
 """
 
@@ -33,6 +34,11 @@ _NETWORK_ENV_KEYS = (
     "REASON_XCHANGE",
     "XCHANGE",
 )
+
+
+def _note(message: str) -> None:
+    """Print a plain-language hint for people without disturbing JSON on stdout."""
+    print(f"Note: {message}", file=sys.stderr)
 
 
 def _resolve_node_url(args) -> Optional[str]:
@@ -75,7 +81,7 @@ def cmd_remember(args):
             "next": ["arbitrate", "admit"],
         }
     # Real token accounting: use public record helper (avoids double-deposit while ensuring
-    # HarnessMetrics gets the tokens_used for accurate savings/velocity/ship-rate).
+    # HarnessMetrics records the tokens_used the caller reported).
     tokens_used = getattr(args, "tokens_used", None) or os.environ.get("RDN_TOKENS_USED")
     if tokens_used:
         try:
@@ -120,6 +126,10 @@ def cmd_resolve(args):
         print(json.dumps(art.resolution_dict(), indent=2))
     else:
         print(json.dumps({"status": "not_found", "address": args.address}, indent=2))
+        _note(
+            "Nothing is saved under that address yet. Save something there with:\n"
+            f'  rdn contribute "your answer" --uri {args.address}'
+        )
         sys.exit(1)
 
     # Real token accounting for resolves (savings from using the current canonical from Xport).
@@ -266,6 +276,8 @@ def cmd_contribute(args):
         flush=bool(args.flush),
     )
     print(json.dumps(result, indent=2))
+    if result.get("warning"):
+        _note(result["warning"])
 
 
 def cmd_queue(args):
@@ -275,6 +287,8 @@ def cmd_queue(args):
             limit=args.limit,
             retry_failed=bool(args.retry_failed),
         )
+        if result.get("message"):
+            _note(result["message"])
     else:
         result = {
             "status": client.contribution_queue_status(),
@@ -309,7 +323,11 @@ def cmd_list(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="rdn",
-        description="ReasonRDN local-first memory with optional WARF network arbitration."
+        description=(
+            "ReasonRDN: a local memory for AI agents. Save notes with 'remember', find them "
+            "with 'recall', and keep reusable answers at a fixed reason:// address with "
+            "'contribute' and 'resolve'. Everything stays on this computer unless you choose to share."
+        )
     )
     parser.add_argument(
         "--version",
@@ -471,44 +489,45 @@ def main():
     p_list.set_defaults(func=cmd_list)
 
     # One-liner experience
-    p_start = sub.add_parser("start", help="Start the ReasonRDN dashboard and local memory harness.")
-    p_start.set_defaults(func=lambda args: launch_harness())
+    p_start = sub.add_parser(
+        "start",
+        help="Start the local web dashboard (needs: pip install \"reason-rdn[dash]\")",
+    )
+    p_start.add_argument("--port", type=int, default=8501, help="Port to use (default 8501)")
+    p_start.add_argument(
+        "--network",
+        action="store_true",
+        help="Also listen on your local network. Off by default: only this computer can open it.",
+    )
+    p_start.add_argument(
+        "--check-services",
+        action="store_true",
+        help="Contact online services on load to show whether they answer.",
+    )
+    p_start.set_defaults(func=launch_harness)
 
     args = parser.parse_args()
-    if hasattr(args, "cmd") and args.cmd == "start":
-        launch_harness()
-    else:
-        args.func(args)
+    args.func(args)
 
 
-def launch_harness():
-    """The one-liner 'start using rdn' experience."""
-    print("\n" + "="*70)
-    print("START USING RDN - THE LOCAL MEMORY HARNESS IS NOW LIVE")
-    print("="*70)
-    print("""
-Instant features you just gained:
-• Persistent local mirror (private node at 8765 + SQLite) that works offline and survives agent sessions
-• Real token accounting: report --tokens-used when depositing; get accurate savings when you (or agents) resolve prior external winners
-• Durable contribution queue: retain locally or deliver bounded organization/shared contributions in the background
-• Explicit scoped resolution: local, organization, and shared layers with exact version pinning preserved
-• WARF bridge: arbitrate competing packages; low-level admit remains compatible
-• Public-boundary design: this package stores local memory and talks to the broker without exposing private scoring internals
-• Live harness metrics (token savings, velocity, ship rate, positive signals) + suggestions that nudge you to produce useful handoffs
-• Unified `import rdn as reason` + CLI/MCP/dash on the same coherent surface
-
-This is the practical on-ramp to reason:// memory and WARF arbitration. Local first, network only when selected.
-
-Launching the full visual harness now...
-""")
+def launch_harness(args=None):
+    """Start the dashboard (``rdn start``)."""
     try:
-        import rdn.dash as dash
-        dash.launch()
-    except Exception:
-        print("\nTo launch the dashboard:")
-        print("  pip install 'reason-rdn[dash]'")
-        print("  rdn start")
-        print("  # or: python -m rdn.dash")
+        import streamlit  # noqa: F401
+    except ImportError:
+        print("The dashboard needs an extra package. Install it with:")
+        print('  pip install "reason-rdn[dash]"')
+        print('  (from a source checkout: pip install -e ".[dash]")')
+        print("Then run: rdn start")
+        raise SystemExit(1)
+    import rdn.dash as dash
+
+    dash.launch(
+        [],
+        port=getattr(args, "port", None) or 8501,
+        network=bool(getattr(args, "network", False)),
+        check_services=bool(getattr(args, "check_services", False)),
+    )
 
 
 if __name__ == "__main__":

@@ -49,18 +49,14 @@ The `admit` SDK and CLI path remains callable for 0.5 compatibility when a
 caller already holds exact arbitration custody. It is not the ordinary agent
 contribution action and is not an advertised MCP tool.
 
-## Related owners
+## Related services
 
-- `monowarfo` owns managed Reason Registry convergence, current-pointer
-  transitions, WARF Gateway service behavior, deployment configuration, and
-  working next-revision RFCXML.
-- `astragnostic-api` owns protected scoring and advancement policies.
-- WARF Arbitration is an associated but independently callable deterministic
-  selection and event-custody product.
-- WARF Edge, Edge Flow, and Xact are a detached Rust on-device cosine-pairing
-  and advertising-matching product domain.
-- Xfer, P2P, and PSV are a detached structural exchange product domain.
-- IETF Datatracker owns the submitted Internet-Draft record.
+- Managed Reason resolver services (the hosted organization and shared
+  layers) own convergence, current-pointer transitions, and their own
+  deployment configuration. They are not part of this repo.
+- WARF (the arbitration service that picks one answer from competing
+  candidates and keeps a record of the decision) is independently callable.
+- IETF Datatracker holds the submitted Internet-Draft record.
 
 ## Separation rules
 
@@ -80,12 +76,10 @@ contribution action and is not an advertised MCP tool.
   version identity.
 - Protected scoring, convergence thresholds, service credentials, and managed
   deployment internals do not belong in this public repo.
-- Edge/Flow/Xact and Xfer/P2P/PSV may connect through adapters but remain
-  separately owned product domains.
 
 ## Check
 
-```powershell
-$python = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
-& $python -m pytest -q
+```bash
+pip install -e ".[dev]"
+pytest
 ```

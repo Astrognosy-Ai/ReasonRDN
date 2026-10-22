@@ -108,14 +108,24 @@ def test_reference_validation_allows_official_empty_namespace_form(
             captured["path"] = path
             captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(
-        "rdn.doclang_adapter.importlib.import_module",
-        lambda name: ReferenceModule if name == "doclang" else None,
+    import importlib.metadata
+    import types
+
+    import rdn.doclang_adapter as doclang_adapter
+
+    # Replace importlib only inside the adapter module. Patching the global
+    # importlib.import_module (as this test used to) also breaks pytest's own
+    # dotted-path lookups for any monkeypatch call that follows it.
+    fake_importlib = types.SimpleNamespace(
+        import_module=lambda name: ReferenceModule if name == "doclang" else None,
+        metadata=importlib.metadata,
     )
     monkeypatch.setattr(
-        "rdn.doclang_adapter._distribution_version",
+        doclang_adapter,
+        "_distribution_version",
         lambda name: "0.7.3" if name == "doclang" else None,
     )
+    monkeypatch.setattr(doclang_adapter, "importlib", fake_importlib)
 
     prepared = prepare_doclang_contribution(source, validation="reference")
 

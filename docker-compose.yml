@@ -5,8 +5,9 @@ services:
     build: .
     container_name: reasonrdn
     ports:
-      - "8501:8501" # Streamlit Dashboard
-      - "8765:8765" # Memory Node API
+      # Published on 127.0.0.1 only. Change to "8501:8501" to allow other computers.
+      - "127.0.0.1:8501:8501" # Dashboard
+      - "127.0.0.1:8765:8765" # Local memory node API
     volumes:
       # Persistent storage for memory database, indexes, and metrics
       - reasonrdn_data:/root/.reason-rdn

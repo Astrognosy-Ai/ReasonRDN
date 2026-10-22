@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reason-rdn"
-version = "0.6.1"
-description = "ReasonRDN - local-first agent memory, reason:// handoffs, and optional WARF arbitration through a unified Python, CLI, MCP, and embedded-node surface."
+version = "0.6.2"
+description = "A local memory store for AI agents: save notes, find them later, and keep reusable answers at fixed reason:// addresses."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
@@ -40,7 +40,8 @@ documents = [
   "docling>=2.119,<3; python_version >= '3.10'",
 ]
 full = ["customtkinter>=5.2.0", "mcp>=1.0.0,<2", "streamlit>=1.30.0", "plotly>=5.0.0"]
-dev = ["pytest", "pyinstaller", "httpx", "black", "ruff"]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "httpx", "black", "ruff", "pyinstaller"]
 
 [project.scripts]
 rdn = "rdn.cli:main"
@@ -70,4 +71,4 @@ target-version = "py39"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-q --tb=short"
+addopts = "--tb=short"

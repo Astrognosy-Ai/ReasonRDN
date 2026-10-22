@@ -17,15 +17,12 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from ..addressing import project_address as _project_address
+from ..config import data_dir
 
 LOGGER = logging.getLogger("rdn.node")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_STORAGE_DIR = os.path.join(
-    os.path.expanduser("~"),
-    ".reason-rdn",
-    "private-node",
-)
+DEFAULT_STORAGE_DIR = str(data_dir() / "private-node")
 PORT_FILE_NAME = "private-node.port"
 
 # Optional bearer token for remote / shared deployments.
@@ -192,7 +189,7 @@ class PrivateWARFRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/recall":
             params = parse_qs(parsed.query)
-            query = (params.get("query", [""])[0] or "").strip()
+            query = (params.get("query", params.get("q", [""]))[0] or "").strip()
             project = (params.get("project", [""])[0] or "").strip() or None
             limit_raw = params.get("limit", ["20"])[0]
             try:

@@ -36,7 +36,7 @@ from .artifact import (
     parse_reason_artifact,
     validate_reason_address,
 )
-from .config import env_flag
+from .config import config_file, data_dir, env_flag
 from .contribution import (
     CONTRIBUTION_IDEMPOTENCY_HEADER,
     CONTRIBUTION_NETWORK_SCOPES,
@@ -66,10 +66,10 @@ except Exception:
 
 logger = logging.getLogger("rdn.client")
 
-DEFAULT_DB_DIR = Path.home() / ".reason-rdn" / "private-node"
+DEFAULT_DB_DIR = data_dir() / "private-node"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "warf-node.db"
 PORT_FILE = DEFAULT_DB_DIR / "private-node.port"
-CONFIG_FILE = Path.home() / ".reason-ecosystem.cfg"
+CONFIG_FILE = config_file()
 
 _RESOLVER_SCOPE_ORDER = tuple(
     str(value) for value in PROTOCOL_LOCK["sdk"]["resolverChainOrder"]
@@ -164,9 +164,9 @@ def _tokenize_query(query: str) -> List[str]:
 
     Rules:
     - Split on whitespace and characters that are not alphanumeric, ``-``, or ``.``
-      so that ``PILOT-025`` and ``0.6.1`` survive intact.
+      so that ``ISSUE-025`` and ``0.6.1`` survive intact.
     - Also index each sub-part of compound tokens split by ``-`` / ``.``,
-      e.g. ``PILOT-025`` additionally yields ``pilot`` and ``025``.
+      e.g. ``ISSUE-025`` additionally yields ``issue`` and ``025``.
     - Strip leading/trailing ``-`` and ``.`` from each token.
     - Remove English stopwords (see ``_RECALL_STOPWORDS``).
     - Return a deduped list preserving first-occurrence order.
@@ -1267,10 +1267,13 @@ class RDNClient:
                 "queue": current,
                 "flush": flush_result,
                 "network_write": flush_result["attempted"] > 0,
+                **self._unconfigured_scope_notice(
+                    envelope.scope, envelope.reason_address
+                ),
             }
 
         scheduled = self._schedule_background_flush() if background else False
-        return {
+        result = {
             "status": queued["state"],
             "contribution_id": envelope.contribution_id,
             "reason_address": envelope.reason_address,
@@ -1278,6 +1281,33 @@ class RDNClient:
             "queue": queued,
             "background_flush_scheduled": scheduled,
             "network_write": False,
+        }
+        result.update(self._unconfigured_scope_notice(envelope.scope, envelope.reason_address))
+        return result
+
+    def _unconfigured_scope_notice(
+        self, scope: str, reason_address: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Explain plainly when a shared layer has no server to deliver to.
+
+        The item stays saved on this machine (and can be read back with a local
+        resolve), and it is sent automatically once a server is configured.
+        """
+        if scope not in CONTRIBUTION_NETWORK_SCOPES or self.resolvers.get(scope):
+            return {"resolver_configured": True} if scope != "local" else {}
+        env_name = f"REASON_{scope.upper()}_RESOLVER"
+        lookup = (
+            f" You can still read it on this machine with: rdn resolve {reason_address}"
+            if reason_address
+            else ""
+        )
+        return {
+            "resolver_configured": False,
+            "warning": (
+                f"No {scope} server is set up, so nothing was sent. The item is saved "
+                f"on this machine and waits in the queue; it will be sent once you set "
+                f"{env_name} (or add it to your config file).{lookup}"
+            ),
         }
 
     def _schedule_background_flush(self) -> bool:
@@ -1619,7 +1649,8 @@ class RDNClient:
                 }
             )
 
-        return {
+        queue_status = self.contribution_queue_status()
+        result: Dict[str, Any] = {
             "selected": len(rows),
             "attempted": sum(
                 1 for item in outcomes if item["status"] != "not_configured"
@@ -1628,8 +1659,24 @@ class RDNClient:
                 1 for item in outcomes if item["status"] == "delivered"
             ),
             "outcomes": outcomes,
-            "queue": self.contribution_queue_status(),
+            "queue": queue_status,
         }
+        waiting: Dict[str, int] = {}
+        for scope in CONTRIBUTION_NETWORK_SCOPES:
+            if self.resolvers.get(scope):
+                continue
+            states = queue_status["by_scope"].get(scope) or {}
+            count = int(states.get("pending", 0)) + int(states.get("retry", 0))
+            if count:
+                waiting[scope] = count
+        if waiting:
+            result["waiting_for_resolver"] = waiting
+            result["message"] = "; ".join(
+                f"{count} {scope} item(s) not sent because no {scope} server is set up "
+                f"(set REASON_{scope.upper()}_RESOLVER to deliver them)"
+                for scope, count in waiting.items()
+            )
+        return result
 
     def runtime_status(self) -> Dict[str, Any]:
         """Return queue and resolver state without network side effects."""
@@ -1697,6 +1744,14 @@ class RDNClient:
             logger.error("Local list_prefix failed: %s", e)
         finally:
             conn.close()
+        try:
+            seen = {item["address"] for item in results}
+            for item in self._local_contributions(prefix, exact=False):
+                if item["address"] not in seen:
+                    seen.add(item["address"])
+                    results.append(item)
+        except Exception as e:
+            logger.error("Local contribution listing failed: %s", e)
         return results[:limit]
 
     # ---------------- Core Operations ----------------
@@ -1995,7 +2050,7 @@ class RDNClient:
                 (canonical_address,),
             ).fetchone()
             if not row:
-                return None
+                return self._resolve_local_contribution(canonical_address, version)
             meta = json.loads(row["metadata_json"])
             parsed = parse_reason_artifact({
                 "address": row["address"],
@@ -2019,6 +2074,92 @@ class RDNClient:
             return None
         finally:
             conn.close()
+
+    def _contribution_is_local_readable(self, scope: str, state: str) -> bool:
+        """Local contributions, and shared-layer items that have nowhere to go yet."""
+        if scope == "local":
+            return True
+        return state in {"pending", "retry"} and not self.resolvers.get(scope)
+
+    def _local_contributions(self, address_prefix: str, exact: bool) -> List[Dict[str, Any]]:
+        """Return locally readable contributions, newest first, as recall-style dicts."""
+        if exact:
+            pattern = f'%"reason_address":"{address_prefix}"%'
+        else:
+            pattern = f'%"reason_address":"{address_prefix}%'
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT scope, state, envelope_json FROM rdn_contribution_queue
+                WHERE envelope_json LIKE ?
+                ORDER BY queue_sequence DESC
+                """,
+                (pattern,),
+            ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            if not self._contribution_is_local_readable(str(row["scope"]), str(row["state"])):
+                continue
+            try:
+                envelope = parse_contribution_envelope(json.loads(row["envelope_json"]))
+                text = envelope.content_bytes().decode("utf-8")
+            except (ValueError, ArtifactValidationError, UnicodeDecodeError):
+                # Binary or unreadable content cannot be returned as inline text.
+                continue
+            address = envelope.reason_address
+            if exact and address != address_prefix:
+                continue
+            if not exact and not address.startswith(address_prefix):
+                continue
+            context = envelope.context or {}
+            items.append(
+                {
+                    "address": address,
+                    "project": context.get("project"),
+                    "deposited_at": envelope.created_at,
+                    "content": text,
+                    "media_type": envelope.artifact["media_type"],
+                    "tags": list(context.get("tags") or []),
+                    "meta": {
+                        "contribution_id": envelope.contribution_id,
+                        "scope": envelope.scope,
+                        "state": str(row["state"]),
+                    },
+                    "source": "local",
+                }
+            )
+        return items
+
+    def _resolve_local_contribution(
+        self, address: str, version: Optional[str]
+    ) -> Optional[ReasonArtifact]:
+        """Look up a contribution saved on this machine under ``address``."""
+        candidates = self._local_contributions(address, exact=True)
+        if not candidates:
+            return None
+        mismatched: Optional[ReasonArtifact] = None
+        for item in candidates:
+            parsed = parse_reason_artifact(
+                {
+                    "address": item["address"],
+                    "media_type": item["media_type"],
+                    "content": item["content"],
+                    "deposited_at": item["deposited_at"],
+                    "project": item["project"],
+                    "tags": item["tags"],
+                    "meta": item["meta"],
+                },
+                source="local",
+            )
+            if version is None or parsed.version == version:
+                return parsed
+            mismatched = mismatched or parsed
+        raise RDNConflictError(
+            409,
+            "local artifact version does not match the requested version",
+            {"address": address, "version": mismatched.version if mismatched else None},
+        )
 
     # ---------------- GUI / Advanced helpers (heartbeat, recent projects) ----------------
 
