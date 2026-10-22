@@ -48,6 +48,12 @@ except ImportError:
     CallToolResult = TextContent = Tool = None
 
 
+def _package_version() -> str:
+    from rdn import __version__
+
+    return __version__
+
+
 def _network_share_envelope(result: object) -> dict:
     """Expose the actual network outcome without hiding a retained local copy."""
     if not isinstance(result, dict):
@@ -82,7 +88,11 @@ class WARFMCPServer:
             raise RuntimeError(
                 "MCP support not installed. Install with: pip install 'reason-rdn[mcp]' or 'reason-rdn[full]'"
             )
-        self.server = Server("ReasonRDN")
+        try:
+            # Report ReasonRDN's own version, not the MCP library's version.
+            self.server = Server("ReasonRDN", version=_package_version())
+        except TypeError:  # very old mcp releases without a version argument
+            self.server = Server("ReasonRDN")
         self.memory = RDNClient()  # honors preferred and compatibility env names
         self._register_tools()
 

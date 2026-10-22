@@ -1,4 +1,4 @@
-"""Focused 0.6.1 contract tests for the ReasonRDN SDK and MCP lock."""
+"""Focused 0.6.x contract tests for the ReasonRDN SDK and MCP lock."""
 
 from __future__ import annotations
 
@@ -77,7 +77,9 @@ def _client(tmp_path, monkeypatch):
 
 def test_protocol_lock_is_the_imported_single_source():
     assert PROTOCOL_LOCK_ID == "astrognosy.reason-artifact/v1"
-    assert PROTOCOL_LOCK["packageVersion"] == "0.6.1"
+    import rdn
+
+    assert PROTOCOL_LOCK["packageVersion"] == rdn.__version__
     assert PROTOCOL_LOCK["eventRecordSchema"] == EVENT_RECORD_SCHEMA
     assert tuple(PROTOCOL_LOCK["artifact"]["fields"]) == CANONICAL_ARTIFACT_FIELDS
     assert tuple(PROTOCOL_LOCK["mcp"]["advertisedTools"]) == MCP_ADVERTISED_TOOLS

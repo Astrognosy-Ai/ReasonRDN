@@ -1,24 +1,21 @@
 """
-rdn — The Coherent reason:// Substrate
+rdn: a local memory store for AI agents.
 
-One clean, local-first package that unifies:
-- Persistent handoffs and project memory with a simple API
-- Explicit WARF arbitration and selected-result Registry admission
-- Local artifact integrity metadata
-- Clean resolution from the Reason Registry
+Save notes, find them again later, and keep reusable answers at fixed
+``reason://team/topic/task`` addresses. Everything stays on this computer
+unless you choose to share it with a team server or the public registry.
 
-The simplest coherent API agents and humans should reach for:
+    import rdn
+    rdn.remember("Fixed the deployment race", tags=["infra"])
+    hits = rdn.recall("deployment race")
 
-    import rdn as reason
-    reason.remember("Fixed the race with prior handoff context", tags=["infra"])
-    art = reason.resolve("reason://ops/ecs/failures")
-
-This package is the open public on-ramp to the reason:// ecosystem.
+    rdn.contribute("Pause writes, restore, verify.", reason_address="reason://ops/deployment/rollback-plan")
+    answer = rdn.resolve("reason://ops/deployment/rollback-plan")
 """
 
 from __future__ import annotations
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from .artifact import (
     CANONICAL_ARTIFACT_FIELDS,
@@ -99,6 +96,7 @@ from .reason import (
     harness_metrics,
     list_prefix,
     network_arbitrate,
+    recall,
     record_handoff,
     record_recall,
     remember,  # module-level simplest API
@@ -140,6 +138,7 @@ __all__ = [
     "prepare_doclang_contribution",
     "Reason",
     "remember",
+    "recall",
     "resolve",
     "list_prefix",
     "add_recent_uri",

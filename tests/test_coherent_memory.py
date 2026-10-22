@@ -173,8 +173,9 @@ def test_harness_metrics_record_functions(tmp_path, monkeypatch):
 
     # Summary shape (what status / dashboard / MCP harness_status expose)
     summary = reason_mod.harness_metrics()
-    assert "velocity" in summary
-    assert "ship_rate" in summary
+    assert "velocity" not in summary  # removed: it was not a meaningful number
+    assert "ship_rate" not in summary  # removed: could exceed 100%
+    assert summary["total_recalls"] == 1
     assert "suggestions" in summary
     assert "total_handoffs" in summary
 
@@ -188,6 +189,12 @@ def test_harness_metrics_record_functions(tmp_path, monkeypatch):
     m4 = reason_mod.harness_metrics()
     assert reason_mod._harness_metrics.data["total_recalls"] == 2
     assert m4["estimated_tokens_saved"] == 920 + 150
+
+    # A lookup without a reported number must not invent savings.
+    reason_mod.record_recall("reason://test/memory/uri")
+    m5 = reason_mod.harness_metrics()
+    assert m5["total_recalls"] == 3
+    assert m5["estimated_tokens_saved"] == 920 + 150
 
 
 def test_gateway_health_uses_public_health_route(tmp_path, monkeypatch):

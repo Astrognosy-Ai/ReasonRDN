@@ -313,7 +313,7 @@ The primary, reliable way (no bundling issues):
 
         print("""
 This launches the harness dashboard with:
-- Live metrics (token savings, velocity, ship rate, positive signals)
+- Real service status and local counts (notes saved, lookups, reported token savings)
 - Workflow suggestions
 - WARF network controls and reason:// explorer
 - A coherent on-ramp experience for local memory and broker participation
@@ -390,7 +390,7 @@ Instantly gained:
 • Model-agnostic persistent local memory
 • Explicit WARF Gateway arbitration and selected-result Registry admission
 • Stable current or pinned reason:// resolution through the Reason Registry
-• Artifact metadata + live harness metrics (tokens saved, velocity, ship rate, positive signals)
+• Artifact metadata + local usage counts (notes saved, lookups, reported token savings)
 • Workflow suggestions that improve how you actually ship
 • Dashboard for local memory, WARF network status, and reason:// browsing
 

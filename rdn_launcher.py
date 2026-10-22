@@ -49,9 +49,9 @@ def get_streamlit_command():
     if is_frozen():
         python = sys.executable
         dash_script = os.path.join(BUNDLE_DIR, "rdn", "dash.py")
-        return [python, "-m", "streamlit", "run", dash_script, "--server.port", "8501", "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+        return [python, "-m", "streamlit", "run", dash_script, "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", "--browser.gatherUsageStats", "false"]
     else:
-        return [sys.executable, "-m", "streamlit", "run", "rdn/dash.py", "--server.port", "8501"]
+        return [sys.executable, "-m", "streamlit", "run", "rdn/dash.py", "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", "--browser.gatherUsageStats", "false"]
 
 def start_local_node(port=8765):
     """Auto-start the embedded private node on first launch (one-stop behavior)."""
@@ -119,8 +119,7 @@ def open_dashboard(dash_port=8501, node_port=8765):
     """
     print(f"\n[rdn] Starting the ReasonRDN dashboard (Streamlit on :{dash_port})...")
     print(f"[rdn] Local private node (memory backend) is on :{node_port}")
-    print("[rdn] This is your one-stop view: live metrics (token savings, velocity, ship rate, positive signals),")
-    print("[rdn] workflow suggestions, WARF arbitration, reason:// explorer, visual fingerprints, etc.")
+    print("[rdn] It shows real service status, what is stored locally, and lets you save and look up notes.")
     
     cmd = get_streamlit_command()
     
@@ -146,7 +145,7 @@ def open_dashboard(dash_port=8501, node_port=8765):
         # Give Streamlit time
         time.sleep(5)
         
-        # Check if the streamlit process died quickly — this is the usual cause of "localhost refused to connect"
+        # Check if the streamlit process died quickly: this is the usual cause of "localhost refused to connect"
         if proc.poll() is not None:
             out, err = proc.communicate()
             print("[rdn] Streamlit process exited early (this is almost always a missing-data bundling problem).")
@@ -259,19 +258,14 @@ def main():
         print("""
 Double-click (or run with no args / "start") does this automatically:
 • Starts the local private node (memory API / "reason db") on port 8765
-• Launches the ReasonRDN dashboard (metrics, token savings, velocity,
-  ship rate, positive signals, workflow suggestions, WARF network controls, etc.)
-• Tries very hard to open the dashboard in your browser
+• Launches the ReasonRDN dashboard (service status, local counts, save and look up notes)
+• Tries to open the dashboard in your browser
 • Shows a system tray icon for ongoing control (re-open dash, restart node, start/stop MCP, quit)
 
-Important ports (this exactly matches your report):
-  • Node (the actual "reason db" / memory backend API):  http://127.0.0.1:8765
-  • Dashboard (the UI/harness with metrics): http://localhost:8501
-
-You saw the dashboard at 8501, which is the harness UI.
-When you manually went to 8765 you saw the local node, which is also correct.
-"No dash opening" = the auto browser launch was flaky from the console .exe (often because streamlit data wasn't bundled due to the warnings you saw).
-The updated package.py below has much stronger --collect and --hidden-import flags so the next build should properly bundle streamlit + plotly and the dash should launch + auto-open reliably from the .exe.
+Ports:
+  • Local node (memory API):  http://127.0.0.1:8765
+  • Dashboard:                http://127.0.0.1:8501
+Both listen on this computer only.
 """)
 
         # Local memory remains available in every network configuration.

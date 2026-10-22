@@ -4,7 +4,7 @@ Tiny bootstrap for ReasonRDN.
 
 Run this one-liner (no prior install needed):
 
-    python -c "$(curl -fsSL https://raw.githubusercontent.com/Astrognosy-Ai/ReasonRDN/main/bootstrap.py)"
+    python -c "$(curl -fsSL https://raw.githubusercontent.com/Astrognosy-Ai/ReasonRDN/public/bootstrap.py)"
 
 Or save it and run:
     python bootstrap.py
@@ -19,7 +19,7 @@ It solves the "I want persistent memory + metrics now" problem for any agent or 
 After this, agents get:
 - One import: import rdn as reason
 - Auto Xchange federation (when you want it)
-- Real token savings tracking, velocity, ship rate, positive signals, workflow suggestions
+- Local usage counts (notes saved, lookups, token savings your agents report)
 - The dashboard that makes the value visible
 
 This is the on-ramp to the warf reasoning substrate. High-quality handoffs you create here can eventually become callable deterministic artifacts in the network.
@@ -41,7 +41,7 @@ def main():
 This tiny script gets you the full coherent experience:
 • Persistent cross-agent memory (local + warf Xchange)
 • Local artifact metadata + real metrics
-• Token savings, velocity, ship rate, and positive signals tracked automatically
+• Local usage counts: notes saved, lookups, and token savings your agents report
 • Workflow suggestions that improve how you ship
 • One dashboard that shows local memory and metrics
 

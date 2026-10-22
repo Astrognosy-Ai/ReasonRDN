@@ -21,18 +21,21 @@ from rdn import RDNClient
 client = RDNClient()
 address = "reason://ops/ecr/private-pull-failures"
 
-artifact = client.resolve(address, source="chain", scope="organization")
+artifact = client.resolve(address)
 if artifact is None:
-    result = client.contribute(
+    client.contribute(
         "Enable the reviewed network setting, then verify an ECR pull.",
         reason_address=address,
-        scope="organization",
         tags=["infra", "ecs", "networking"],
     )
+    artifact = client.resolve(address)
+print(artifact.content)
 ```
 
-The SDK writes the contribution to SQLite before its bounded background
-delivery attempt. Local scope retains the contribution and never POSTs.
+With the default local scope the answer is saved on this computer and can be
+looked up right away. Pass `scope="organization"` (with an organization server
+set up) to also queue it for your team; it is saved locally first and sent in
+the background.
 
 ## Exact documents
 
@@ -54,13 +57,13 @@ digest. ReasonRDN does not reserialize the document.
 Run the same resolve-before-convert loop with a local DocLang or
 Docling-supported file:
 
-```powershell
-$python = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
-& $python .\examples\resolve_doclang_contribute.py .\runbook.dclg `
-  --uri reason://ops/runbook/rollback `
+```bash
+python examples/resolve_doclang_contribute.py examples/runbook.dclg \
+  --uri reason://ops/runbook/rollback \
   --scope local
 ```
 
+`examples/runbook.dclg` is a tiny sample file included so this runs as is.
 Local is the default scope. The example performs no fetch or publication.
 
 ## Independent WARF arbitration
@@ -83,17 +86,25 @@ remains available for compatibility.
 
 ## CLI
 
-```powershell
+```bash
 rdn remember "Useful deployment note" --project ops --tags deploy,ecs
 rdn recall "deployment note" --project ops
+rdn contribute "Enable the reviewed setting, then verify" \
+  --uri reason://ops/ecr/private-pull-failures
+rdn resolve reason://ops/ecr/private-pull-failures
+
+# Team sharing, once an organization server is set up
+# (export REASON_ORGANIZATION_RESOLVER=https://reason.example.org):
 rdn resolve reason://ops/ecr/private-pull-failures --source chain --scope organization
-rdn contribute "Enable the reviewed setting, then verify" `
-  --uri reason://ops/ecr/private-pull-failures `
+rdn contribute "Enable the reviewed setting, then verify" \
+  --uri reason://ops/ecr/private-pull-failures \
   --scope organization
 rdn queue
 rdn queue --flush
 ```
 
+On Windows PowerShell, put each command on one line or end lines with a
+backtick instead of `\`.
 ## Security notes
 
 - Local memory and local contributions remain on the local machine by default.

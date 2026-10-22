@@ -1104,7 +1104,10 @@ def test_cli_doclang_prepares_file_then_uses_ordinary_contribute(
 
 
 def test_optional_document_extras_remain_outside_core() -> None:
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.9 and 3.10
+        tomllib = pytest.importorskip("tomli")
 
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]

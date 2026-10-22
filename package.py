@@ -1,5 +1,5 @@
 """
-package.py — Build the simplified rdn.exe Windows channel.
+package.py: Build the simplified rdn.exe Windows channel.
 
 Per the SELECTIVE EXPANSION plan, the EXE is a honest "download and run"
 channel for Windows users: CLI + local private node (8765) + system tray.
@@ -74,7 +74,7 @@ def build_one_stop_exe():
         "--name", "rdn",
         "--add-data", f"rdn;rdn",
         "--add-data", f"bootstrap.py;.",
-        # Find actual package dirs and add them explicitly — this bypasses the "not a package" skip
+        # Find actual package dirs and add them explicitly: this bypasses the "not a package" skip
         # (we compute these paths a few lines above in the script)
         f"--add-data={streamlit_dir};streamlit",
         f"--add-data={plotly_dir};plotly",
@@ -126,7 +126,7 @@ def build_one_stop_exe():
         subprocess.check_call(cmd)
         exe_path = os.path.join("dist", "rdn.exe")
         print("\n" + "=" * 70)
-        print("✅ BUILD SUCCESSFUL — rdn.exe (simplified Windows channel) READY")
+        print("✅ BUILD SUCCESSFUL: rdn.exe (simplified Windows channel) READY")
         print("=" * 70)
         print(f"\nExecutable: {exe_path}")
         print("\nWhat the EXE delivers (per selective plan: CLI + local node + tray only):")
@@ -153,7 +153,7 @@ def build_one_stop_exe():
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(exe_path, "rdn.exe")
             # Include a tiny readme for the zip
-            readme = """rdn — Simplified Windows Channel (CLI + Node + Tray)
+            readme = """rdn: Simplified Windows Channel (CLI + Node + Tray)
 
 Double-click rdn.exe or run with no args:
 - Auto-starts local private node (8765, unless XCHANGE mode)
@@ -170,7 +170,7 @@ See the root README for the current public architecture.
 """
             z.writestr("README.txt", readme)
         print(f"\n✓ Portable zip created: {zip_path}")
-        print("   Distribute the zip or just the .exe — both are one-stop.")
+        print("   Distribute the zip or just the .exe: both are one-stop.")
     except Exception as e:
         print(f"Note: Could not create portable zip (non-fatal): {e}")
 
