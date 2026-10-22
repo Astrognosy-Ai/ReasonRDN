@@ -1939,6 +1939,35 @@ class RDNClient:
                 parsed.append((row, meta, haystack))
                 all_haystacks.append(haystack)
 
+            # Contributions saved on this machine are searchable too.
+            try:
+                remembered = {row["address"] for row, _, _ in parsed}
+                for item in self._local_contributions("reason://", exact=False):
+                    if item["address"] in remembered:
+                        continue
+                    if project and item.get("project") != project:
+                        continue
+                    remembered.add(item["address"])
+                    meta = dict(item["meta"])
+                    meta.update({"content": item["content"], "tags": item["tags"]})
+                    pseudo_row = {
+                        "address": item["address"],
+                        "domain": item.get("project") or "",
+                        "deposited_at": item["deposited_at"],
+                    }
+                    haystack = " ".join(
+                        [
+                            pseudo_row["address"],
+                            pseudo_row["domain"],
+                            pseudo_row["deposited_at"],
+                            json.dumps(meta, ensure_ascii=True),
+                        ]
+                    ).lower()
+                    parsed.append((pseudo_row, meta, haystack))
+                    all_haystacks.append(haystack)
+            except Exception as e:
+                logger.error("Local contribution search failed: %s", e)
+
             n_docs = len(parsed) or 1
             idf = _idf_score(tokens, all_haystacks, n_docs) if use_token_search else {}
 

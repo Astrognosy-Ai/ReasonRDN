@@ -304,3 +304,16 @@ def test_mcp_server_reports_package_version() -> None:
 
     options = WARFMCPServer().server.create_initialization_options()
     assert options.server_version == rdn.__version__
+
+
+def test_recall_finds_local_contributions(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    client.contribute(
+        "Pause writes, restore, verify, then switch traffic.",
+        reason_address=ADDRESS,
+        scope="local",
+        project="ops",
+    )
+    hits = client.recall("switch traffic")
+    assert [hit["address"] for hit in hits] == [ADDRESS]
+    assert client.recall("switch traffic", project="other") == []
