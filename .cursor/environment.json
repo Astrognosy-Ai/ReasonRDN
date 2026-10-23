@@ -1,0 +1,20 @@
+{
+  "name": "ReasonRDN",
+  "install": "pip install -e '.[mcp,dash]' 'pytest<9' ruff black",
+  "terminals": [
+    {
+      "name": "rdn-node",
+      "command": "python3 -m rdn.node.server --host 0.0.0.0 --port 8765",
+      "description": "Local ReasonRDN memory node (HTTP API + SQLite) on port 8765. Health: GET /api/health."
+    },
+    {
+      "name": "rdn-dashboard",
+      "command": "RDN_NODE_PORT=8765 python3 -m streamlit run rdn/dash.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false",
+      "description": "Streamlit dashboard on port 8501. Deposit/recall/resolve reason:// handoffs and view harness metrics."
+    }
+  ],
+  "ports": [
+    { "name": "dashboard", "port": 8501 },
+    { "name": "memory-node", "port": 8765 }
+  ]
+}
